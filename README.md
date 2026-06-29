@@ -1,6 +1,6 @@
 # Waze Parallel Segments
 
-A Tampermonkey/Greasemonkey userscript for the [Waze Map Editor](https://www.waze.com/editor) that splits two-way road segments into parallel one-way carriageways. Supports both **left-hand traffic (LHT)** and **right-hand traffic (RHT)** countries with automatic side detection.
+A Tampermonkey userscript for the [Waze Map Editor](https://www.waze.com/editor) that splits two-way road segments into parallel one-way carriageways. Supports both **left-hand traffic (LHT)** and **right-hand traffic (RHT)** countries with automatic side detection.
 
 ## Features
 
@@ -14,7 +14,7 @@ A Tampermonkey/Greasemonkey userscript for the [Waze Map Editor](https://www.waz
 
 ## Installation
 
-1. Install the [Tampermonkey](https://www.tampermonkey.net/) or [Greasemonkey](https://www.greasespot.net/) browser extension.
+1. Install the [Tampermonkey](https://www.tampermonkey.net/) browser extension.
 2. Install the script from [GreasyFork](https://greasyfork.org/en/scripts/491466-waze-parallel-segments).
 3. The script will automatically load when you open the [Waze Map Editor](https://www.waze.com/editor).
 
