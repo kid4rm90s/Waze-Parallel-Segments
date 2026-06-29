@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Waze Parallel Segments
-// @version      2026.04.18.01
+// @version      2026.06.29.01
 // @description  Splits two-way segments into parallel one-way carriageways. Supports both left-hand and right-hand traffic countries.
 // @author       kid4rm90s & copilot (original author J0N4S13)
 // @include 	 /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor.*$/
@@ -17,21 +17,21 @@
 Original Author Thanks : J0N4S13 (jonathanserrario@gmail.com)
 Migrated to WME SDK by kid4rm90s
 */
-// @downloadURL https://update.greasyfork.org/scripts/491466/WAZEParallel%20Segments%20Mod%20for%20NP.user.js
-// @updateURL   https://update.greasyfork.org/scripts/491466/WAZEParallel%20Segments%20Mod%20for%20NP.meta.js
+// @downloadURL https://update.greasyfork.org/scripts/491466/Waze%20Parallel%20Segments.user.js
+// @updateURL https://update.greasyfork.org/scripts/491466/Waze%20Parallel%20Segments.meta.js
 // ==/UserScript==
 
 (function () {
     'use strict';
 
     // ─── Script metadata ────────────────────────────────────────────────────────
-    const updateMessage = `This script has been migrated to the <strong>WME SDK</strong>.<br>` +
-        `Both left-hand and right-hand traffic countries are now supported.<br><br>` +
-        `<em>Happy Mapping!</em>`;
+    const updateMessage = `<strong>Whats new?</strong>.<br>` +
+        `Proper lanes count detection and split segments.<br><br>` +
+        `<em>Enjoy Mapping!</em>`;
     const scriptName = GM_info.script.name;
     const scriptVersion = GM_info.script.version;
     const downloadUrl = GM_info.script.downloadURL;
-    const forumURL = 'https://greasyfork.org/en/scripts/491466-WAZEParallel-segments-mod-for-np/feedback';
+    const forumURL = 'https://greasyfork.org/en/scripts/491466-waze-parallel-segments/feedback';
 
     // ─── Road type IDs ──────────────────────────────────────────────────────────
     // Road types that are drivable (used in deactivated road-conversion code kept for reference)
@@ -82,14 +82,14 @@ Migrated to WME SDK by kid4rm90s
                             const country = sdk.DataModel.Countries.getById({ countryId: city.countryId });
                             if (country != null) {
                                 isLeftHandTraffic = country.isLeftHandTraffic ?? true;
-                                console.debug('[WAZEParallel] Traffic side:', isLeftHandTraffic ? 'LHT' : 'RHT', '— country (from segment chain):', country.name);
+                                console.log(`${scriptName} Traffic side:`, isLeftHandTraffic ? 'LHT' : 'RHT', '— country (from segment chain):', country.name);
                                 return;
                             }
                         }
                     }
                 }
             } catch (e) {
-                console.warn('[WAZEParallel] Segment-chain country detection failed:', e);
+                console.log(`${scriptName} Segment-chain country detection failed:`, e);
             }
         }
         // Fallback: top country for the current map view.
@@ -97,13 +97,13 @@ Migrated to WME SDK by kid4rm90s
             const topCountry = sdk.DataModel.Countries.getTopCountry();
             if (topCountry != null) {
                 isLeftHandTraffic = topCountry.isLeftHandTraffic ?? true;
-                console.debug('[WAZEParallel] Traffic side:', isLeftHandTraffic ? 'LHT' : 'RHT', '— country (from getTopCountry):', topCountry.name);
+                console.log(`${scriptName} Traffic side:`, isLeftHandTraffic ? 'LHT' : 'RHT', '— country (from getTopCountry):', topCountry.name);
                 return;
             }
         } catch (e) {
-            console.warn('[WAZEParallel] getTopCountry() failed:', e);
+            console.log(`${scriptName} getTopCountry() failed:`, e);
         }
-        console.warn('[WAZEParallel] Could not detect traffic side — keeping', isLeftHandTraffic ? 'LHT' : 'RHT');
+        console.log(`${scriptName} Could not detect traffic side — keeping`, isLeftHandTraffic ? 'LHT' : 'RHT');
     }
 
     // ─── Bootstrap ───────────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ Migrated to WME SDK by kid4rm90s
     }
 
     function initSdk() {
-        sdk = unsafeWindow.getWmeSdk({ scriptId: 'WAZEParallel-segments-mod-np', scriptName: scriptName });
+        sdk = unsafeWindow.getWmeSdk({ scriptId: 'Waze-Parallel-Segments', scriptName: scriptName });
         sdk.Events.once({ eventName: 'wme-ready' }).then(init);
     }
 
@@ -205,10 +205,11 @@ Migrated to WME SDK by kid4rm90s
         for (const segId of selection.ids) {
             const seg = sdk.DataModel.Segments.getById({ segmentId: segId });
             if (!seg) continue;
-            // fwdLaneCount / revLaneCount → fromLanesInfo / toLanesInfo lane counts
-            const fwdLanes = seg.fromLanesInfo ? seg.fromLanesInfo.laneCount : 0;
-            const revLanes = seg.toLanesInfo ? seg.toLanesInfo.laneCount : 0;
-            if (fwdLanes !== 0 || revLanes !== 0) { exit = true; break; }
+            // fwdLanes / revLanes → fromLanesInfo / toLanesInfo numberOfLanes (SDK SegmentLanesInfo)
+            const fwdLanes = seg.fromLanesInfo?.numberOfLanes ?? 0;
+            const revLanes = seg.toLanesInfo?.numberOfLanes ?? 0;
+            // Only show the button if lane counts match (both 0 = no lanes, both N = symmetrical)
+            if (fwdLanes !== revLanes) { exit = true; break; }
             // Must be strictly two-way — use SDK Segment.isTwoWay property
             if (!seg.isTwoWay) { exit = true; break; }
             if (pedestrianRoadIds.includes(seg.roadType)) { exit = true; break; }
@@ -271,13 +272,13 @@ Migrated to WME SDK by kid4rm90s
         const selection = sdk.Editing.getSelection();
         if (!selection || selection.objectType !== 'segment') return [];
         const selectedIds = selection.ids;
-        console.debug('[WAZEParallel] orderSegments: total selected =', selectedIds.length, 'ids =', selectedIds);
+        console.log(`${scriptName} orderSegments: total selected =`, selectedIds.length, 'ids =', selectedIds);
 
         const nodeOccurrences = [];
         for (const segId of selectedIds) {
             const seg = sdk.DataModel.Segments.getById({ segmentId: segId });
-            if (!seg) { console.warn('[WAZEParallel] orderSegments: segment not found in model:', segId); continue; }
-            console.debug(`[WAZEParallel] orderSegments: seg ${segId} fromNode=${seg.fromNodeId} toNode=${seg.toNodeId}`);
+            if (!seg) { console.log(`${scriptName} orderSegments: segment not found in model:`, segId); continue; }
+            console.log(`${scriptName} orderSegments: seg ${segId} fromNode=${seg.fromNodeId} toNode=${seg.toNodeId}`);
             if (nodeOccurrences.length > 0) {
                 let fromExists = false;
                 let toExists = false;
@@ -292,17 +293,17 @@ Migrated to WME SDK by kid4rm90s
                 nodeOccurrences.push([seg.toNodeId, 1]);
             }
         }
-        console.debug('[WAZEParallel] orderSegments: node occurrence map =', nodeOccurrences);
+        console.log(`${scriptName} orderSegments: node occurrence map =`, nodeOccurrences);
 
         let nextNodeId = null;
         for (const entry of nodeOccurrences) {
             if (entry[1] === 1) { nextNodeId = entry[0]; break; }
         }
-        console.debug('[WAZEParallel] orderSegments: start node =', nextNodeId);
+        console.log(`${scriptName} orderSegments: start node =`, nextNodeId);
 
         if (nextNodeId === null) {
             // Circular selection or disconnected — fall back to original order
-            console.warn('[WAZEParallel] orderSegments: no endpoint node found (circular?), using original order');
+            console.log(`${scriptName} orderSegments: no endpoint node found (circular?), using original order`);
             return [...selectedIds];
         }
 
@@ -316,14 +317,14 @@ Migrated to WME SDK by kid4rm90s
                 const seg = sdk.DataModel.Segments.getById({ segmentId: segId });
                 if (!seg) { remaining.delete(segId); found = true; break; }
                 if (seg.fromNodeId === nextNodeId) {
-                    console.debug(`[WAZEParallel] orderSegments: placed seg ${segId} (fromNode match, next=${seg.toNodeId})`);
+                    console.log(`${scriptName} orderSegments: placed seg ${segId} (fromNode match, next=${seg.toNodeId})`);
                     orderedSegIds.push(segId);
                     nextNodeId = seg.toNodeId;
                     remaining.delete(segId);
                     found = true;
                     break;
                 } else if (seg.toNodeId === nextNodeId) {
-                    console.debug(`[WAZEParallel] orderSegments: placed seg ${segId} (toNode match, next=${seg.fromNodeId})`);
+                    console.log(`${scriptName} orderSegments: placed seg ${segId} (toNode match, next=${seg.fromNodeId})`);
                     orderedSegIds.push(segId);
                     nextNodeId = seg.fromNodeId;
                     remaining.delete(segId);
@@ -332,11 +333,11 @@ Migrated to WME SDK by kid4rm90s
                 }
             }
             if (!found) {
-                console.warn('[WAZEParallel] orderSegments: chain broken at node', nextNodeId, '— remaining unplaced:', [...remaining]);
+                console.log(`${scriptName} orderSegments: chain broken at node`, nextNodeId, '— remaining unplaced:', [...remaining]);
                 break;
             }
         }
-        console.debug('[WAZEParallel] orderSegments: result =', orderedSegIds);
+        console.log(`${scriptName} orderSegments: result =`, orderedSegIds);
         return orderedSegIds;
     }
 
@@ -371,7 +372,7 @@ Migrated to WME SDK by kid4rm90s
     // after the first to fail silently.
     function executeSplit() {
         const distance = parseFloat(document.getElementById('segmentsDistance').value);
-        console.debug('[WAZEParallel] executeSplit start — distance:', distance);
+        console.log(`${scriptName} executeSplit start — distance:`, distance);
 
         last_node_A = null;
         last_node_B = null;
@@ -382,17 +383,17 @@ Migrated to WME SDK by kid4rm90s
         baseDirection = null;
 
         const orderedSegIds = orderSegments();
-        console.debug('[WAZEParallel] executeSplit: ordered segment IDs =', orderedSegIds,
+        console.log(`${scriptName} executeSplit: ordered segment IDs =`, orderedSegIds,
             '(', orderedSegIds.length, 'of', sdk.Editing.getSelection()?.ids?.length, 'selected)');
 
         if (orderedSegIds.length === 0) {
-            console.warn('[WAZEParallel] executeSplit: nothing to split');
+            console.log(`${scriptName} executeSplit: nothing to split`);
             return;
         }
 
         // Lazy traffic-side detection — use first segment for accurate per-segment chain lookup.
         detectTrafficSide(orderedSegIds[0]);
-        console.debug('[WAZEParallel] executeSplit: isLeftHandTraffic =', isLeftHandTraffic);
+        console.log(`${scriptName} executeSplit: isLeftHandTraffic =`, isLeftHandTraffic);
 
         const isMultiSeg = orderedSegIds.length > 1;
 
@@ -402,12 +403,12 @@ Migrated to WME SDK by kid4rm90s
         // verification flags; allowNodeTurns already sets the final turn state correctly.
         let AddNodeLegacy = null;
         if (isMultiSeg) {
-            console.debug('[WAZEParallel] Multi-segment mode: loading legacy AddNode');
+            console.log(`${scriptName} Multi-segment mode: loading legacy AddNode`);
             try {
                 AddNodeLegacy = require('Waze/Action/AddNode');
-                console.debug('[WAZEParallel] Legacy AddNode loaded OK');
+                console.log(`${scriptName} Legacy AddNode loaded OK`);
             } catch (e) {
-                console.error('[WAZEParallel] Failed to load legacy AddNode:', e);
+                console.error(`${scriptName} Failed to load legacy AddNode:`, e);
             }
         }
 
@@ -436,7 +437,7 @@ Migrated to WME SDK by kid4rm90s
             const idsegment = orderedSegIds[i];
             const segment = sdk.DataModel.Segments.getById({ segmentId: idsegment });
             if (!segment) {
-                console.warn('[WAZEParallel] executeSplit: segment not found in model (may already be split):', idsegment);
+                console.log(`${scriptName} executeSplit: segment not found in model (may already be split):`, idsegment);
                 continue;
             }
 
@@ -449,11 +450,11 @@ Migrated to WME SDK by kid4rm90s
                 if (i === 1) {
                     if (connMode === 'AB' || connMode === 'AA') baseDirection = 'BA';
                     if (connMode === 'BA' || connMode === 'BB') baseDirection = 'AB';
-                    console.debug('[WAZEParallel] executeSplit: baseDirection set to', baseDirection);
+                    console.log(`${scriptName} executeSplit: baseDirection set to`, baseDirection);
                 }
             }
 
-            console.debug(`[WAZEParallel] Segment ${i}: id=${idsegment} connMode=${connMode}  fromNode=${segment.fromNodeId} toNode=${segment.toNodeId}  lastA=${last_node_A} lastB=${last_node_B}`);
+            console.log(`${scriptName} executeSplit: Segment ${i}: id=${idsegment} connMode=${connMode}  fromNode=${segment.fromNodeId} toNode=${segment.toNodeId}  lastA=${last_node_A} lastB=${last_node_B}`);
 
             if (connMode === 'AA' || connMode === 'BB') {
                 last_node_A = segment.toNodeId;
@@ -465,11 +466,11 @@ Migrated to WME SDK by kid4rm90s
 
             const segments = createSegments(segment, distance, connMode);
             if (!segments) {
-                console.warn('[WAZEParallel] executeSplit: createSegments returned null for segment', idsegment);
+                console.log(`${scriptName} executeSplit: createSegments returned null for segment`, idsegment);
                 continue;
             }
-            console.debug(`[WAZEParallel] Segment ${i} split → left=${segments[0]} right=${segments[1]}`);
-            console.debug('[WAZEParallel] Coord cache after split:',
+            console.log(`${scriptName} executeSplit: Segment ${i} split → left=${segments[0]} right=${segments[1]}`);
+            console.log(`${scriptName} executeSplit: Coord cache after split:`,
                 'L[0]:', JSON.stringify(last_coord_left_first),
                 'L[-1]:', JSON.stringify(last_coord_left_last),
                 'R[0]:', JSON.stringify(last_coord_right_first),
@@ -506,7 +507,7 @@ Migrated to WME SDK by kid4rm90s
                     }
                 } else {
                     // Fallback to cached coords if SDK can't find the segment yet
-                    console.warn('[WAZEParallel] SDK segment not found for coord read, falling back to cache. left:', segments[0], 'right:', segments[1]);
+                    console.log(`${scriptName} SDK segment not found for coord read, falling back to cache. left:`, segments[0], 'right:', segments[1]);
                     if (connMode === 'BA' || connMode === 'BB') {
                         leftCoord  = { type: 'Point', coordinates: last_coord_left_first };
                         rightCoord = { type: 'Point', coordinates: last_coord_right_last };
@@ -516,18 +517,18 @@ Migrated to WME SDK by kid4rm90s
                     }
                 }
 
-                console.debug(`[WAZEParallel] AddNode LEFT  coord=${JSON.stringify(leftCoord)}  segs: prev=${prevLeftId} curr=${segments[0]}  wme: prev=${!!prevLeftWme} curr=${!!currLeftWme}`);
-                console.debug(`[WAZEParallel] AddNode RIGHT coord=${JSON.stringify(rightCoord)} segs: prev=${prevRightId} curr=${segments[1]}  wme: prev=${!!prevRightWme} curr=${!!currRightWme}`);
+                console.log(`${scriptName} AddNode LEFT  coord=${JSON.stringify(leftCoord)}  segs: prev=${prevLeftId} curr=${segments[0]}  wme: prev=${!!prevLeftWme} curr=${!!currLeftWme}`);
+                console.log(`${scriptName} AddNode RIGHT coord=${JSON.stringify(rightCoord)} segs: prev=${prevRightId} curr=${segments[1]}  wme: prev=${!!prevRightWme} curr=${!!currRightWme}`);
 
                 if (prevLeftWme && currLeftWme && leftCoord) {
                     actionsToAdd.push(AddNodeWrapper(leftCoord, [prevLeftWme, currLeftWme]));
                 } else {
-                    console.warn('[WAZEParallel] AddNode LEFT skipped — missing:', { prevLeftWme: !!prevLeftWme, currLeftWme: !!currLeftWme, leftCoord });
+                    console.log(`${scriptName} AddNode LEFT skipped — missing:`, { prevLeftWme: !!prevLeftWme, currLeftWme: !!currLeftWme, leftCoord });
                 }
                 if (prevRightWme && currRightWme && rightCoord) {
                     actionsToAdd.push(AddNodeWrapper(rightCoord, [prevRightWme, currRightWme]));
                 } else {
-                    console.warn('[WAZEParallel] AddNode RIGHT skipped — missing:', { prevRightWme: !!prevRightWme, currRightWme: !!currRightWme, rightCoord });
+                    console.log(`${scriptName} AddNode RIGHT skipped — missing:`, { prevRightWme: !!prevRightWme, currRightWme: !!currRightWme, rightCoord });
                 }
             }
 
@@ -537,14 +538,14 @@ Migrated to WME SDK by kid4rm90s
 
         // ── Phase 2: dispatch all AddNode actions now that all segments are split.
         if (isMultiSeg) {
-            console.debug(`[WAZEParallel] Dispatching ${actionsToAdd.length} AddNode action(s)`);
+            console.log(`${scriptName} Dispatching ${actionsToAdd.length} AddNode action(s)`);
             actionsToAdd.forEach(a => W.model.actionManager.add(a));
 
             // SDK: allowNodeTurns replaces legacy ModifyAllConnections.
-            console.debug('[WAZEParallel] Allowing turns at all nodes of produced segments via SDK');
+            console.log(`${scriptName} Allowing turns at all nodes of produced segments via SDK`);
             for (const segId of [...leftSegIds, ...rightSegIds]) {
                 const seg = sdk.DataModel.Segments.getById({ segmentId: segId });
-                if (!seg) { console.warn('[WAZEParallel] allowNodeTurns: SDK segment missing for seg', segId); continue; }
+                if (!seg) { console.log(`${scriptName} allowNodeTurns: SDK segment missing for seg`, segId); continue; }
                 if (seg.fromNodeId !== null) sdk.DataModel.Nodes.allowNodeTurns({ nodeId: seg.fromNodeId, allow: true });
                 if (seg.toNodeId   !== null) sdk.DataModel.Nodes.allowNodeTurns({ nodeId: seg.toNodeId,   allow: true });
             }
@@ -558,7 +559,7 @@ Migrated to WME SDK by kid4rm90s
             }
         }
 
-        console.debug('[WAZEParallel] executeSplit done — left segs:', leftSegIds, '/ right segs:', rightSegIds);
+        console.log(`${scriptName} executeSplit done — left segs:`, leftSegIds, '/ right segs:', rightSegIds);
         WazeToastr.Alerts.success(
             scriptName,
             `Successfully split ${leftSegIds.length} segment${leftSegIds.length > 1 ? 's' : ''} with ${distance}m gap!`
@@ -573,7 +574,7 @@ Migrated to WME SDK by kid4rm90s
     // already in WGS84.
     //
     function createSegments(sel, displacement, connMode) {
-        console.debug('[WAZEParallel] createSegments: segId=', sel.id, 'displacement=', displacement, 'connMode=', connMode);
+        console.log(`${scriptName} createSegments: segId=`, sel.id, 'displacement=', displacement, 'connMode=', connMode);
         // SDK: segment.geometry is already a GeoJSON LineString { type:'LineString', coordinates:[[lon,lat],...] }
         const geomCoords = sel.geometry.coordinates;
 
@@ -662,7 +663,7 @@ Migrated to WME SDK by kid4rm90s
         leftPoints.pop();
 
         // Split the original segment at midpoint using SDK
-        console.debug('[WAZEParallel] createSegments: calling SplitSegment, leftPoints=', leftPoints.length, 'rightPoints=', rightPoints.length);
+        console.log(`${scriptName} createSegments: calling SplitSegment, leftPoints=`, leftPoints.length, 'rightPoints=', rightPoints.length);
         const splitIds = SplitSegment(sel);
         if (!splitIds) return null;
 
@@ -712,7 +713,7 @@ Migrated to WME SDK by kid4rm90s
         const leftSegId  = splitIds[0];
         const rightSegId = splitIds[1];
 
-        console.debug('[WAZEParallel] createSegments: updateSegment geometry left=', leftSegId, 'right=', rightSegId);
+        console.log(`${scriptName} createSegments: updateSegment geometry left=`, leftSegId, 'right=', rightSegId);
         // SDK: updateSegment with new geometry — replaces UpdateSegmentGeometry action
         sdk.DataModel.Segments.updateSegment({ segmentId: leftSegId,  geometry: newGeomLeft });
         sdk.DataModel.Segments.updateSegment({ segmentId: rightSegId, geometry: newGeomRight });
@@ -745,16 +746,16 @@ Migrated to WME SDK by kid4rm90s
             sdk.DataModel.Segments.updateSegment({ segmentId: rightSegId, direction: 'A_TO_B' });
         }
 
-        console.debug('[WAZEParallel] createSegments done — returning', splitIds);
+        console.log(`${scriptName} createSegments done — returning`, splitIds);
         return splitIds;
     }
     // Replaces legacy Waze/Action/SplitSegments require() pattern.
     // SDK: DataModel.Segments.splitSegment({ segmentId, splitPoint: GeoJSON Point })
     //
     function SplitSegment(seg) {
-        console.debug('[WAZEParallel] SplitSegment: segId=', seg.id, 'coords=', seg.geometry.coordinates.length);
+        console.log(`${scriptName} SplitSegment: segId=`, seg.id, 'coords=', seg.geometry.coordinates.length);
         if (!sdk.DataModel.Segments.hasPermissions({ segmentId: seg.id })) {
-            console.warn('[WAZEParallel] SplitSegment: no permissions for segment', seg.id);
+            console.log(`${scriptName} SplitSegment: no permissions for segment`, seg.id);
             return undefined;
         }
 
@@ -827,7 +828,9 @@ Migrated to WME SDK by kid4rm90s
 
 })();
 
-/* Changelog 2026.03.31.01 - Replaced broken segment-address country detection with sdk.Countries.getTopCountry().
+/* Changelog 
+2026.06.29.01 - Fixed issue with lane count and able to split segments with equal number of defined lanes on both sides. Added a check to ensure that the segment has equal or zero defined lane on each side before proceeding with the split.
+2026.03.31.01 - Replaced broken segment-address country detection with sdk.Countries.getTopCountry().
                  The SDK Segment interface has no .address property, so seg?.address?.country was
                  always undefined. detectTrafficSide() now calls sdk.Countries.getTopCountry()
                  directly and reads isLeftHandTraffic from the returned Country object.
