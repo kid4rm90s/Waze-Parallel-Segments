@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Waze Parallel Segments Beta
-// @version      2026.09.24.01
+// @version      2026.09.25.10
 // @description  Splits two-way segments into parallel one-way carriageways, and adjusts existing one-way segments to be parallel to a user-drawn guide line. Supports both left-hand and right-hand traffic countries.
 // @author       kid4rm90s & copilot (original author J0N4S13)
 // @include 	 /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor.*$/
@@ -13,6 +13,7 @@
 // @grant        unsafeWindow
 // @require 	 https://greasyfork.org/scripts/560385/code/WazeToastr.js
 // @require      https://cdn.jsdelivr.net/npm/@turf/turf@7/turf.min.js
+// @require      https://cdn.jsdelivr.net/gh/TheEditorX/wme-sdk-plus@0b212bcaddf3e7983b28b220d120e0dd687a74d1/wme-sdk-plus.js
 // @namespace    https://greasyfork.org/users/1087400
 /* 
 Original Author Thanks : J0N4S13 (jonathanserrario@gmail.com)
@@ -21,7 +22,7 @@ Migrated to WME SDK by kid4rm90s
 // @downloadURL https://raw.githubusercontent.com/kid4rm90s/Waze-Parallel-Segments/Beta/Waze-Parallel-Segments-Beta.user.js
 // @updateURL https://raw.githubusercontent.com/kid4rm90s/Waze-Parallel-Segments/Beta/Waze-Parallel-Segments-Beta.user.js
 
-// ==/UserScript==
+// ==/UserScript== 
 /**To Do */
 // Select segment at one side and another same segment at the other side and it will select all the segments in between.
 (function () {
@@ -37,14 +38,27 @@ Migrated to WME SDK by kid4rm90s
     const forumURL = 'https://github.com/kid4rm90s/Waze-Parallel-Segments/issues';
 
     // ─── Road type IDs ──────────────────────────────────────────────────────────
-    // Road types that are drivable (used in deactivated road-conversion code kept for reference)
-    const drivableRoadIds = [3, 4, 6, 7, 2, 1, 22, 8, 20, 17, 15, 18, 19];
     // Road types considered pedestrian (excluded from split)
     const pedestrianRoadIds = [5, 10, 16];
 
     // Minimum clearance (metres) the drawn guide line must leave past the
     // furthest projection of the selected segments, at both ends.
     const GUIDE_CLEARANCE_M = 5;
+    // Miter cap for the guide-line offset. Offsetting a vertex by halfD / cos(theta/2)
+    // would push a sharp corner arbitrarily far out, so the factor is clamped here.
+    // 2.0 covers deflections up to 120 degrees; past that the vertex under-offsets
+    // slightly rather than spiking.
+    const OFFSET_MITER_MAX = 2.0;
+    // Rounded joins on the convex side of a bend: number of arc steps. Even, so the arc
+    // has a well-defined middle point. The offset stays exact whatever this is, because
+    // the arc radius is exactly halfD.
+    const OFFSET_ARC_STEPS = 2;
+    // A position within this fraction of an edge end counts as landing on the vertex
+    // itself, so both neighbouring segments agree on where the shared node goes.
+    const VERTEX_EPS = 1e-6;
+    // The same tolerance in metres, for deciding whether a guide vertex lies strictly
+    // inside a segment's span.
+    const VERTEX_EPS_M = 0.01;
     // Sanity bounds for the "distance between segments" input. The dropdown only
     // offers 5–45 m; the upper bound exists purely to catch a bad value (e.g. a
     // typed 1000) before it flings segments off the road.
@@ -52,6 +66,10 @@ Migrated to WME SDK by kid4rm90s
     // A reconciled segment shorter than this is treated as collapsed — WME
     // rejects zero-length geometry, so the run is aborted before any mutation.
     const MIN_SEGMENT_SPAN_M = 0.1;
+    // How far the point handed to AddNode may sit from a participating segment's end
+    // before the placement is reported as wrong. WME accepts a point that misses and
+    // silently drags the segment to meet the new node, so this is measured, not assumed.
+    const ADD_NODE_TOLERANCE_M = 0.05;
 
     const language = {
         btnSplit: "Split the segments",
@@ -65,6 +83,7 @@ Migrated to WME SDK by kid4rm90s
         strMakeParallelBadDistance: "Choose a valid distance (a positive number of metres) before making segments parallel.",
         strGuideTooShort: "Guide line is too short. The drawn line must extend past both ends of the selected segments (minimum {margin}m clearance at each end).",
         strMakeParallelFailed: "Could not make the segments parallel — the changes were rolled back. See the console for details.",
+        strSplitFailed: "Could not split the segments — the changes were rolled back. See the console for details.",
         strDrawingInProgress: "A drawing is already in progress — finish or cancel it first.",
         strWouldCollapse: "That distance collapses at least one selected segment to a point — nothing was changed. Try a smaller gap."
     };
@@ -76,15 +95,77 @@ Migrated to WME SDK by kid4rm90s
     let last_coord_left_last = null;
     let last_coord_right_first = null;
     let last_coord_right_last = null;
-    let baseDirection = null;
 
     // ─── SDK instance ────────────────────────────────────────────────────────
     let sdk = null;
 
+    // ─── Transactions (WME SDK+ · Editing.Transactions) ──────────────────────
+    // The native SDK has no action-grouping API — sdk.Editing only exposes
+    // undo / redo / undoAll — so a multi-step edit produces one undo entry per
+    // mutation. sdk.Editing.doActions(), supplied by the wme-sdk-plus library
+    // @require'd above, dispatches every action raised inside a callback as a
+    // single MultiAction instead: ONE undo entry, and a throw discards the lot.
+    // See https://github.com/TheEditorX/wme-sdk-plus/wiki
+    //
+    // Deliberately drives begin/commit/cancel rather than doActions() itself, so a
+    // validation path can abort via `return false` instead of leaving an empty
+    // entry in the WME change log. (It also sidesteps doActions()'s refusal to
+    // accept async callbacks.)
+    const hasTransactions = () => typeof sdk?.Editing?.beginTransaction === 'function';
+
+    // Runs fn as a single transaction and returns its result. If fn returns false
+    // the transaction is cancelled rather than committed. When transaction support
+    // is unavailable the callback runs unwrapped — each mutation is then its own
+    // undo entry and there is no atomic rollback.
+    function withTransaction(description, fn) {
+        if (!hasTransactions()) {
+            return fn();
+        }
+        sdk.Editing.beginTransaction();
+        let result;
+        try {
+            result = fn();
+        } catch (ex) {
+            // Discards every action captured so far — this is the rollback.
+            try {
+                sdk.Editing.cancelTransaction();
+            } catch (cancelEx) {
+                console.error(`${scriptName} cancelTransaction failed:`, cancelEx);
+            }
+            throw ex;
+        }
+        if (result === false) {
+            sdk.Editing.cancelTransaction();
+            return result;
+        }
+        sdk.Editing.commitTransaction(description);
+        return result;
+    }
+
+    // Undoes our own mutations back to a previously recorded unsaved-change count.
+    // After a transaction cancel this is a no-op (the count is already restored), so
+    // it only does real work on the no-transaction-support fallback path.
+    function rollbackToUnsavedCount(unsavedBefore) {
+        // Re-read the live count every pass: WME may coalesce several of our
+        // mutations into one undo entry, so a pre-computed step count would
+        // over-revert and delete edits the user made before this run. Stop as
+        // soon as the count stops falling, and cap the loop defensively.
+        for (let guard = 0; guard < 500 && sdk.Editing.getUnsavedChangesCount() > unsavedBefore; guard++) {
+            const before = sdk.Editing.getUnsavedChangesCount();
+            try {
+                sdk.Editing.undo();
+            } catch (undoEx) {
+                console.error(`${scriptName} rollback undo failed:`, undoEx);
+                break;
+            }
+            if (sdk.Editing.getUnsavedChangesCount() >= before) break; // no progress
+        }
+    }
+
     // ─── Debug tracing ───────────────────────────────────────────────────────
     // Flip to true when diagnosing geometry problems. Keeps normal runs free of
     // per-vertex coordinate dumps, which are expensive on large selections.
-    const DEBUG = true;
+    const DEBUG = false;
     const log = (...args) => { if (DEBUG) console.log(...args); };
 
     // ─── Traffic side ────────────────────────────────────────────────────────
@@ -146,7 +227,22 @@ Migrated to WME SDK by kid4rm90s
         sdk.Events.once({ eventName: 'wme-ready' }).then(init);
     }
 
-    function init() {
+    async function init() {
+        // wme-sdk-plus has to be initialised before any transaction is started, and
+        // only once the SDK itself is ready — hence here rather than in initSdk().
+        // Only the module we actually use is requested, so the library does not also
+        // install its middleware, XHR and event patches.
+        try {
+            if (typeof initWmeSdkPlus === 'function') {
+                await initWmeSdkPlus(sdk, { hooks: ['Editing.Transactions'] });
+                console.log(`${scriptName} wme-sdk-plus ready (Editing.Transactions)`);
+            } else {
+                console.warn(`${scriptName} wme-sdk-plus not loaded — splits and parallel runs will use one undo entry per change.`);
+            }
+        } catch (ex) {
+            console.error(`${scriptName} wme-sdk-plus init failed — continuing without transactions:`, ex);
+        }
+
         // Best-effort early detection — no segment yet, falls back to getTopCountry().
         detectTrafficSide(null);
         // Register for selection change events (SDK equivalent of selectionManager.events.register)
@@ -435,7 +531,6 @@ Migrated to WME SDK by kid4rm90s
         last_coord_left_last = null;
         last_coord_right_first = null;
         last_coord_right_last = null;
-        baseDirection = null;
 
         const orderedSegIds = orderSegments();
         console.log(`${scriptName} executeSplit: ordered segment IDs =`, orderedSegIds,
@@ -467,6 +562,35 @@ Migrated to WME SDK by kid4rm90s
             }
         }
 
+        // The whole mutation phase runs as ONE transaction: the split becomes a
+        // single undo entry, and a throw anywhere inside it discards every change
+        // instead of leaving a half-split road behind on the map.
+        let produced;
+        try {
+            produced = withTransaction(
+                `Split ${orderedSegIds.length} segment(s)`,
+                () => executeSplitMutations(orderedSegIds, distance, isMultiSeg, AddNodeLegacy)
+            );
+        } catch (ex) {
+            console.error(`${scriptName} executeSplit failed — changes rolled back:`, ex);
+            WazeToastr.Alerts.error(scriptName, language.strSplitFailed);
+            return;
+        }
+
+        const { leftSegIds: splitLeft, rightSegIds: splitRight } = produced;
+        console.log(`${scriptName} executeSplit done — left segs:`, splitLeft, '/ right segs:', splitRight);
+        WazeToastr.Alerts.success(
+            scriptName,
+            `Successfully split ${splitLeft.length} segment${splitLeft.length > 1 ? 's' : ''} with ${distance}m gap!`
+        );
+    }
+
+    // ─── executeSplitMutations: the mutation phase of executeSplit ───────────
+    // Split out so it can be handed to withTransaction() as one synchronous
+    // callback without re-indenting it. Mutates the map and returns the produced
+    // segment IDs; it shares the module-level split state (last_node_A/B and the
+    // coord caches) with its caller.
+    function executeSplitMutations(orderedSegIds, distance, isMultiSeg, AddNodeLegacy) {
         // AddNodeWrapper — mirrors the legacy version exactly.
         // Delays getAffectedUniqueIds until the node actually exists, preventing
         // the action manager from throwing when the node hasn't been created yet.
@@ -476,7 +600,31 @@ Migrated to WME SDK by kid4rm90s
             base.getAffectedUniqueIds = function (dataModel) {
                 return this.node ? origGetAffected(dataModel) : [];
             };
+            // Remember what we asked for, so verifyAddNodes() can compare it against what
+            // the SDK reports once the action has run.
+            base.intendedPoint = point?.coordinates ? [...point.coordinates] : null;
+            base.intendedSegmentIds = segments
+                .map(s => (typeof s?.getID === 'function' ? s.getID() : s?.attributes?.id))
+                .filter(id => id != null);
             return base;
+        }
+
+        // Move a carriageway's junction-side endpoint onto the computed junction point.
+        // Without this the previous carriageway keeps its own natural offset endpoint,
+        // which is a DIFFERENT point whenever the road bends at the junction — leaving the
+        // node, the previous carriageway and the new segment disagreeing about where the
+        // junction is.
+        function pullCarriagewayEnd(segmentId, sdkSeg, point, nodeCoord, label) {
+            if (!sdkSeg || !point || !nodeCoord) return;
+            const coords = sdkSeg.geometry.coordinates.map(c => [...c]);
+            const idx = nearestEndIndex(coords, nodeCoord).index;
+            if (distanceMetres(coords[idx], point) < 0.001) return;
+            coords[idx] = [...point];
+            sdk.DataModel.Segments.updateSegment({
+                segmentId,
+                geometry: { type: 'LineString', coordinates: coords }
+            });
+            console.log(`${scriptName} junction ${label}: pulled prev carriageway ${segmentId} end #${idx} onto the junction point`);
         }
 
         const leftSegIds = [];
@@ -502,10 +650,12 @@ Migrated to WME SDK by kid4rm90s
                 if (last_node_B === segment.fromNodeId) connMode = 'BA';
                 if (last_node_A === segment.fromNodeId) connMode = 'AA';
                 if (last_node_B === segment.toNodeId)   connMode = 'BB';
-                if (i === 1) {
-                    if (connMode === 'AB' || connMode === 'AA') baseDirection = 'BA';
-                    if (connMode === 'BA' || connMode === 'BB') baseDirection = 'AB';
-                    console.log(`${scriptName} executeSplit: baseDirection set to`, baseDirection);
+                // connMode is only ever assigned, never cleared, so a pair that matches
+                // none of the four silently reuses the PREVIOUS iteration's mode. That
+                // would aim the endpoint adjustment (and the AddNode point) at the wrong
+                // end. Make it visible before deciding to skip the join instead.
+                if (!['AB', 'BA', 'AA', 'BB'].includes(connMode)) {
+                    console.warn(`${scriptName} connMode UNRESOLVED at i=${i} (seg ${idsegment}) — no node matches lastA=${last_node_A} lastB=${last_node_B} against from=${segment.fromNodeId} to=${segment.toNodeId}; reusing "${connMode}"`);
                 }
             }
 
@@ -519,7 +669,22 @@ Migrated to WME SDK by kid4rm90s
                 last_node_B = segment.toNodeId;
             }
 
-            const segments = createSegments(segment, distance, connMode);
+            // Where this segment's carriageways must meet the previous ones: the
+            // intersection of the two offset lines, so both stay parallel and the node sits
+            // on the shared junction node's perpendicular. Must be computed BEFORE the
+            // split, because it needs this segment's ORIGINAL geometry, which
+            // createSegments overwrites.
+            let junctionSnap = null;
+            if (i > 0 && isMultiSeg) {
+                junctionSnap = parallelJunctionSnap(
+                    leftSegIds[leftSegIds.length - 1],
+                    rightSegIds[rightSegIds.length - 1],
+                    segment,
+                    distance / 2
+                );
+            }
+
+            const segments = createSegments(segment, distance, connMode, junctionSnap);
             if (!segments) {
                 console.log(`${scriptName} executeSplit: createSegments returned null for segment`, idsegment);
                 continue;
@@ -539,8 +704,10 @@ Migrated to WME SDK by kid4rm90s
                 // no W.userscripts.toGeoJSONGeometry conversion needed.
                 // For BA/BB: curr-left first point; curr-right last point.
                 // For AB/AA: curr-left last point; curr-right first point.
+                const prevLeftSdk  = sdk.DataModel.Segments.getById({ segmentId: prevLeftId });
                 const currLeftSdk  = sdk.DataModel.Segments.getById({ segmentId: segments[0] });
                 const currRightSdk = sdk.DataModel.Segments.getById({ segmentId: segments[1] });
+                const prevRightSdk = sdk.DataModel.Segments.getById({ segmentId: prevRightId });
                 // Legacy WME objects still required as participants for the AddNode action.
                 const prevLeftWme  = W.model.segments.getObjectById(prevLeftId);
                 const currLeftWme  = W.model.segments.getObjectById(segments[0]);
@@ -553,27 +720,50 @@ Migrated to WME SDK by kid4rm90s
                 if (currLeftSdk && currRightSdk) {
                     const leftCoords  = currLeftSdk.geometry.coordinates;
                     const rightCoords = currRightSdk.geometry.coordinates;
-                    if (connMode === 'BA' || connMode === 'BB') {
-                        leftCoord  = { type: 'Point', coordinates: leftCoords[0] };
-                        rightCoord = { type: 'Point', coordinates: rightCoords[rightCoords.length - 1] };
-                    } else { // AB, AA
-                        leftCoord  = { type: 'Point', coordinates: leftCoords[leftCoords.length - 1] };
-                        rightCoord = { type: 'Point', coordinates: rightCoords[0] };
-                    }
+                    leftCoord  = { type: 'Point', coordinates: leftCoords[junctionIndex(leftCoords, connMode, true)] };
+                    rightCoord = { type: 'Point', coordinates: rightCoords[junctionIndex(rightCoords, connMode, false)] };
                 } else {
-                    // Fallback to cached coords if SDK can't find the segment yet
+                    // Fallback to cached coords if SDK can't find the segment yet.
+                    // These MUST be the previous segment's cached junction ends — the same
+                    // values createSegments() copied into this geometry — so the selection
+                    // has to follow junctionAtEnd() exactly. It previously took the OPPOSITE
+                    // end of both carriageways, which put the node a whole segment length
+                    // away and left WME to drag a segment across to meet it.
                     console.log(`${scriptName} SDK segment not found for coord read, falling back to cache. left:`, segments[0], 'right:', segments[1]);
-                    if (connMode === 'BA' || connMode === 'BB') {
-                        leftCoord  = { type: 'Point', coordinates: last_coord_left_first };
-                        rightCoord = { type: 'Point', coordinates: last_coord_right_last };
-                    } else {
-                        leftCoord  = { type: 'Point', coordinates: last_coord_left_last };
-                        rightCoord = { type: 'Point', coordinates: last_coord_right_first };
-                    }
+                    const atEnd = junctionAtEnd(connMode);
+                    leftCoord  = { type: 'Point', coordinates: atEnd ? last_coord_left_first  : last_coord_left_last };
+                    rightCoord = { type: 'Point', coordinates: atEnd ? last_coord_right_last : last_coord_right_first };
                 }
 
                 console.log(`${scriptName} AddNode LEFT  coord=${JSON.stringify(leftCoord)}  segs: prev=${prevLeftId} curr=${segments[0]}  wme: prev=${!!prevLeftWme} curr=${!!currLeftWme}`);
                 console.log(`${scriptName} AddNode RIGHT coord=${JSON.stringify(rightCoord)} segs: prev=${prevRightId} curr=${segments[1]}  wme: prev=${!!prevRightWme} curr=${!!currRightWme}`);
+
+                // Both carriageways must END on the junction point, not just the new one:
+                // the previous carriageway still sits on its own natural offset endpoint,
+                // which is a different point whenever the road bends here. createSegments
+                // has already written the new segment's end from junctionSnap, so only the
+                // previous carriageway needs pulling.
+                pullCarriagewayEnd(prevLeftId,  prevLeftSdk,  junctionSnap?.left,  junctionSnap?.node, 'LEFT');
+                pullCarriagewayEnd(prevRightId, prevRightSdk, junctionSnap?.right, junctionSnap?.node, 'RIGHT');
+
+                // Measure the placement before dispatching, AFTER the pull so the check sees
+                // the geometry that will actually be used. The point is only correct if it
+                // sits on the facing end of BOTH segments being joined.
+                logAddNodeCheck('LEFT',  leftCoord,
+                    sdk.DataModel.Segments.getById({ segmentId: prevLeftId }),
+                    sdk.DataModel.Segments.getById({ segmentId: segments[0] }));
+                logAddNodeCheck('RIGHT', rightCoord,
+                    sdk.DataModel.Segments.getById({ segmentId: prevRightId }),
+                    sdk.DataModel.Segments.getById({ segmentId: segments[1] }));
+
+                // Where the node sits relative to the SHARED point, in the terms the map
+                // shows: straight junctions must be perpendicular to it.
+                logJunctionOffset('LEFT',  leftCoord,  junctionSnap?.node,
+                    sdk.DataModel.Segments.getById({ segmentId: prevLeftId }),
+                    sdk.DataModel.Segments.getById({ segmentId: segments[0] }), distance / 2);
+                logJunctionOffset('RIGHT', rightCoord, junctionSnap?.node,
+                    sdk.DataModel.Segments.getById({ segmentId: prevRightId }),
+                    sdk.DataModel.Segments.getById({ segmentId: segments[1] }), distance / 2);
 
                 if (prevLeftWme && currLeftWme && leftCoord) {
                     actionsToAdd.push(AddNodeWrapper(leftCoord, [prevLeftWme, currLeftWme]));
@@ -596,13 +786,27 @@ Migrated to WME SDK by kid4rm90s
             console.log(`${scriptName} Dispatching ${actionsToAdd.length} AddNode action(s)`);
             actionsToAdd.forEach(a => W.model.actionManager.add(a));
 
+            // Ask the SDK what those actions actually produced.
+            verifyAddNodes(actionsToAdd);
+
             // SDK: allowNodeTurns replaces legacy ModifyAllConnections.
             console.log(`${scriptName} Allowing turns at all nodes of produced segments via SDK`);
+            let nodeIdsSeen = 0;
             for (const segId of [...leftSegIds, ...rightSegIds]) {
                 const seg = sdk.DataModel.Segments.getById({ segmentId: segId });
                 if (!seg) { console.log(`${scriptName} allowNodeTurns: SDK segment missing for seg`, segId); continue; }
-                if (seg.fromNodeId !== null) sdk.DataModel.Nodes.allowNodeTurns({ nodeId: seg.fromNodeId, allow: true });
-                if (seg.toNodeId   !== null) sdk.DataModel.Nodes.allowNodeTurns({ nodeId: seg.toNodeId,   allow: true });
+                // != null, not !== null: an unsaved segment can report these as undefined.
+                if (seg.fromNodeId != null) { nodeIdsSeen++; sdk.DataModel.Nodes.allowNodeTurns({ nodeId: seg.fromNodeId, allow: true }); }
+                if (seg.toNodeId   != null) { nodeIdsSeen++; sdk.DataModel.Nodes.allowNodeTurns({ nodeId: seg.toNodeId,   allow: true }); }
+            }
+            // A freshly split, unsaved segment reported no usable from/to node ids on a real
+            // run. In that case there is nothing here to enable turns on, and the run would
+            // otherwise look like it had done so — which is why the README asks you to verify
+            // turn restrictions at the new junctions.
+            if (nodeIdsSeen === 0) {
+                console.warn(`${scriptName} allowNodeTurns: none of the ${leftSegIds.length + rightSegIds.length} produced segments exposed from/to node ids — turns were NOT touched`);
+            } else {
+                console.log(`${scriptName} allowNodeTurns: ${nodeIdsSeen} node id(s) across ${leftSegIds.length + rightSegIds.length} produced segments`);
             }
         } else {
             // Single segment — pure SDK turn-allowance.
@@ -614,11 +818,7 @@ Migrated to WME SDK by kid4rm90s
             }
         }
 
-        console.log(`${scriptName} executeSplit done — left segs:`, leftSegIds, '/ right segs:', rightSegIds);
-        WazeToastr.Alerts.success(
-            scriptName,
-            `Successfully split ${leftSegIds.length} segment${leftSegIds.length > 1 ? 's' : ''} with ${distance}m gap!`
-        );
+        return { leftSegIds, rightSegIds };
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -672,13 +872,14 @@ Migrated to WME SDK by kid4rm90s
         );
     }
 
-    // ─── applyMakeParallel: validated wrapper with rollback ──────────────
+    // ─── applyMakeParallel: validated wrapper, runs as one transaction ────
     // Every SDK mutation (moveNode / updateSegment / updateTurn) creates its own
-    // undo entry and the SDK has no action-grouping API, so a failure half-way
-    // through would leave a partially reshaped junction. Snapshot the unsaved
-    // change counter first and undo back to it on failure.
-    // rollback is delta-based, so the user's earlier unsaved edits
-    // survive untouched; replace with a single transaction if the SDK adds one.
+    // undo entry, so a failure half-way through would leave a partially reshaped
+    // junction and the user would need one undo per mutation to clean it up. The
+    // reshape therefore runs inside a single transaction: success commits it as
+    // ONE undo entry, while any throw (or a validation abort returning false)
+    // discards the whole run. The delta-based rollback is kept only for the
+    // no-transaction-support fallback — after a cancel it is a no-op.
     function applyMakeParallel(line, segmentIds, distance) {
         if (!Number.isFinite(distance) || distance <= 0 || distance > MAX_PARALLEL_GAP_M) {
             WazeToastr.Alerts.error(scriptName, language.strMakeParallelBadDistance);
@@ -691,23 +892,22 @@ Migrated to WME SDK by kid4rm90s
 
         const unsavedBefore = sdk.Editing.getUnsavedChangesCount();
         try {
-            applyMakeParallelCore(line, segmentIds, distance);
+            const applied = withTransaction(
+                'Make segments parallel',
+                () => applyMakeParallelCore(line, segmentIds, distance)
+            );
+            // false = a pre-mutation validation path aborted; core already showed
+            // the reason and the transaction was discarded.
+            if (applied === false) return;
+
+            const msg = language.strMakeParallelSuccess
+                .replace('{count}', segmentIds.length)
+                .replace('{plural}', segmentIds.length > 1 ? 's' : '')
+                .replace('{distance}', distance);
+            WazeToastr.Alerts.success(scriptName, msg);
         } catch (ex) {
             console.error(`${scriptName} applyMakeParallel failed — rolling back:`, ex);
-            // Re-read the live count every pass: WME may coalesce several of our
-            // mutations into one undo entry, so a pre-computed step count would
-            // over-revert and delete edits the user made before this run. Stop as
-            // soon as the count stops falling, and cap the loop defensively.
-            for (let guard = 0; guard < 500 && sdk.Editing.getUnsavedChangesCount() > unsavedBefore; guard++) {
-                const before = sdk.Editing.getUnsavedChangesCount();
-                try {
-                    sdk.Editing.undo();
-                } catch (undoEx) {
-                    console.error(`${scriptName} rollback undo failed:`, undoEx);
-                    break;
-                }
-                if (sdk.Editing.getUnsavedChangesCount() >= before) break; // no progress
-            }
+            rollbackToUnsavedCount(unsavedBefore);
             WazeToastr.Alerts.error(scriptName, language.strMakeParallelFailed);
         }
     }
@@ -768,8 +968,12 @@ Migrated to WME SDK by kid4rm90s
         }
         log(`${scriptName} Node connectivity:`, JSON.stringify([...nodeSegments].map(([n, s]) => [n, [...s]])));
 
+        // Drop repeated coordinates first: a zero-length edge leaves the offset's
+        // bisector undefined and makes turf.bearing() return 0 for the pair, which
+        // would corrupt both the offset and the side detection below.
+        const lineCoords = dedupeCoords(line.coordinates);
+
         // Simplify the drawn line to reduce vertex count
-        const lineCoords = line.coordinates;
         const guideCoords = turf.simplify(turf.lineString(lineCoords), {
             tolerance: 0.000001,
             highQuality: true
@@ -781,7 +985,7 @@ Migrated to WME SDK by kid4rm90s
         if (guideCoords.length < 2) {
             console.error(`${scriptName} guide line has too few coordinates`);
             WazeToastr.Alerts.error(scriptName, language.strMakeParallelFailed);
-            return;
+            return false;
         }
 
         const guideLine = turf.lineString(guideCoords);
@@ -817,7 +1021,7 @@ Migrated to WME SDK by kid4rm90s
             (minDistM < marginMeters || guideLengthM - maxDistM < marginMeters)) {
             console.error(`${scriptName} VALIDATION FAILED: earliest projection ${minDistM.toFixed(1)}m from start, ${(guideLengthM - maxDistM).toFixed(1)}m from end, margin ${marginMeters}m`);
             WazeToastr.Alerts.error(scriptName, language.strGuideTooShort.replace('{margin}', marginMeters));
-            return;
+            return false;
         }
         log(`${scriptName} Validation PASSED`);
 
@@ -1018,7 +1222,7 @@ Migrated to WME SDK by kid4rm90s
             }
             if (!trueMinCoord || !trueMaxCoord) continue;
 
-            // Slice the guide line from min to max and offset it.
+            // Slice the guide line from min to max.
             // trueMinLoc ≤ trueMaxLoc always holds (the minimum of the per-segment
             // minima can never exceed the maximum of the per-segment maxima), so
             // one slice direction covers every case.
@@ -1031,63 +1235,41 @@ Migrated to WME SDK by kid4rm90s
                 sliceCoords = [trueMinCoord, trueMaxCoord];
             }
 
-            // Subdivide short slices to ensure enough offset vertices for curve
-            // fidelity — when both endpoints fall on the same guide segment, the
-            // slice has only 2 coords and the offset line becomes a straight line.
-            // (The earlier turf.simplify only drops duplicate vertices, so this is
-            // complementary, not redundant.)
-            if (sliceCoords.length < 8) {
-                const guideSliceLine = turf.lineString(sliceCoords);
-                const sliceLenKm = turf.length(guideSliceLine, { units: 'kilometers' });
-                const targetPoints = 8;
-                const subdivided = [];
-                for (let i = 0; i <= targetPoints; i++) {
-                    const pt = turf.along(guideSliceLine, (i / targetPoints) * sliceLenKm, { units: 'kilometers' });
-                    subdivided.push(pt.geometry.coordinates);
-                }
-                sliceCoords = subdivided;
-            }
+            // ── Place every node by ARC LENGTH along the guide ────────────────
+            // Each node is found by walking the guide to its arc length and stepping
+            // halfD along the LOCAL edge normal there, so it lands opposite the point
+            // it was projected from. The previous approach mapped a guide fraction
+            // onto a fraction of the offset line's own length, which assumed the
+            // offset stretches the guide proportionally — it cannot, because each
+            // guide leg shortens by a constant halfD·tan(theta/2) at a bend. On a
+            // corner with uneven legs that slid nodes along the curve by up to 15.8m
+            // (measured). Arc-length placement carries no such assumption.
+            const sliceCum = cumulativeLengthsM(sliceCoords);
+            const sliceTotalM = sliceCum[sliceCum.length - 1];
+            const vertexGroups = offsetVertexCoords(sliceCoords, halfD, side);
 
-            log(`${scriptName}     ${side} side: slice has ${sliceCoords.length} coords (after subdivision)`);
+            // properties.location is kilometres along the guide, so the segment's span
+            // converts to metres from the slice start; clamp it into the slice.
+            const toSliceMetres = (loc) =>
+                Math.max(0, Math.min(sliceTotalM, (loc - trueMinLoc) * 1000));
 
-            // Offset the slice
-            const fullOffsetCoords = offsetGuideLine(sliceCoords, halfD, side);
-            const offsetLine = turf.lineString(fullOffsetCoords);
-            const offsetLengthM = turf.length(offsetLine, { units: 'meters' });
-            // Span along the guide, in the same linear units as properties.location.
-            const totalSpanDist = trueMaxLoc - trueMinLoc;
-            log(`${scriptName}     ${side} side: offset has ${fullOffsetCoords.length} coords, length=${offsetLengthM.toFixed(2)}m`);
+            log(`${scriptName}     ${side} side: slice has ${sliceCoords.length} coords / ${sliceTotalM.toFixed(1)}m`);
 
-            // Slice each segment's portion and record positions
+            // Cut each segment's portion of the offset and record positions
             for (const s of segs) {
-                const segStartLoc = Math.min(s.startLoc, s.endLoc);
-                const segEndLoc = Math.max(s.startLoc, s.endLoc);
-                // Guide fractions index the offset line: the ratio is unit-free, so
-                // km-based locations can address a metre-based offset distance.
-                // this: assumes the offset tracks the guide length exactly; on
-                // tight curves the two lengths differ and segment boundaries drift
-                // by that difference.
-                const fracStart = totalSpanDist > 0 ? (segStartLoc - trueMinLoc) / totalSpanDist : 0;
-                const fracEnd = totalSpanDist > 0 ? (segEndLoc - trueMinLoc) / totalSpanDist : 1;
+                const dStart = toSliceMetres(Math.min(s.startLoc, s.endLoc));
+                const dEnd = toSliceMetres(Math.max(s.startLoc, s.endLoc));
 
-                const distStart = Math.max(0, Math.min(offsetLengthM, fracStart * offsetLengthM));
-                const distEnd = Math.max(0, Math.min(offsetLengthM, fracEnd * offsetLengthM));
-                const ptStartOnOffset = turf.along(offsetLine, distStart, { units: 'meters' });
-                const ptEndOnOffset = turf.along(offsetLine, distEnd, { units: 'meters' });
-
-                let segSlice = turf.lineSlice(ptStartOnOffset, ptEndOnOffset, offsetLine);
-                let segCoords = segSlice.geometry.coordinates;
+                const segCoords = offsetSliceSegment(
+                    sliceCoords, vertexGroups, sliceCum, dStart, dEnd, halfD, side
+                );
 
                 // Reverse if the segment's original orientation was reversed
                 if (s.startLoc > s.endLoc) {
                     segCoords.reverse();
                 }
 
-                if (segCoords.length < 2) {
-                    segCoords = [ptStartOnOffset.geometry.coordinates, ptEndOnOffset.geometry.coordinates];
-                }
-
-                // Record the node position from the first slice endpoint seen.
+                // Record the node position from the first endpoint seen.
                 // Step 8 then snaps every segment endpoint onto these positions,
                 // so ordering here cannot leave geometry and nodes disagreeing.
                 if (!neutralNodeIds.has(s.fromNodeId) && !nodeNewPositions.has(s.fromNodeId)) {
@@ -1098,7 +1280,7 @@ Migrated to WME SDK by kid4rm90s
                 }
 
                 segmentNewGeometries.set(s.segId, segCoords);
-                log(`${scriptName}     seg ${s.segId} (${side}): frac=[${fracStart.toFixed(4)},${fracEnd.toFixed(4)}], offset slice has ${segCoords.length} coords`);
+                log(`${scriptName}     seg ${s.segId} (${side}): span=[${dStart.toFixed(1)}m,${dEnd.toFixed(1)}m], geometry has ${segCoords.length} coords`);
             }
         }
 
@@ -1149,7 +1331,7 @@ Migrated to WME SDK by kid4rm90s
             if (spanM < MIN_SEGMENT_SPAN_M) {
                 console.error(`${scriptName} aborting: seg ${segId} would collapse to ${spanM.toFixed(3)}m`);
                 WazeToastr.Alerts.error(scriptName, language.strWouldCollapse);
-                return;
+                return false;
             }
         }
 
@@ -1245,11 +1427,7 @@ Migrated to WME SDK by kid4rm90s
             }
         }
 
-        const msg = language.strMakeParallelSuccess
-            .replace('{count}', segmentIds.length)
-            .replace('{plural}', segmentIds.length > 1 ? 's' : '')
-            .replace('{distance}', distance);
-        WazeToastr.Alerts.success(scriptName, msg);
+        return true;
     }
 
     // ─── determineSideOfLine: which geometric side of a guide line a segment is on ──
@@ -1299,42 +1477,542 @@ Migrated to WME SDK by kid4rm90s
         return cross > 0 ? 'left' : 'right';
     }
 
-    // ─── offsetGuideLine: offset a line's coordinates perpendicularly ──────
-    // Offsets each point of the guide line by halfD in the given geometric
-    // side direction (left or right). Uses turf.destination for WGS84 math.
-    function offsetGuideLine(guideCoords, halfD, side) {
-        const result = [];
-        const halfDKm = halfD / 1000;
+    // ─── dedupeCoords: drop consecutive repeated coordinates ────────────────
+    // A repeated point creates a zero-length edge, which leaves the offset's angle
+    // bisector undefined and makes turf.bearing() return 0 for that pair — both of
+    // which silently corrupt the offset and the side detection. The draw tool can
+    // emit the same position twice. (Idiom borrowed from WazePT Segments.)
+    function dedupeCoords(coords) {
+        const out = [];
+        for (const coord of coords) {
+            const prev = out[out.length - 1];
+            if (!prev || prev[0] !== coord[0] || prev[1] !== coord[1]) out.push(coord);
+        }
+        return out;
+    }
+
+    // ─── unitVectorMetres: unit vector from coord a to coord b ─────────────
+    // Only the direction is used, so an equirectangular scaling at the reference
+    // latitude is exact for our purposes — and unlike turf.bearing it stays
+    // well-defined however short the edge is.
+    function unitVectorMetres(a, b) {
+        const kx = Math.cos(a[1] * Math.PI / 180);
+        const dx = (b[0] - a[0]) * kx;
+        const dy = b[1] - a[1];
+        const len = Math.hypot(dx, dy);
+        return len > 0 ? { x: dx / len, y: dy / len } : { x: 0, y: 0 };
+    }
+
+    // ─── bearingFromXY: compass bearing of an (east, north) vector ─────────
+    // Bearing 0° = north (y) and 90° = east (x), hence atan2(x, y).
+    function bearingFromXY(x, y) {
+        return (Math.atan2(x, y) * 180 / Math.PI + 360) % 360;
+    }
+
+    // ─── offsetAlongNormal: step `halfD` from a point along a side normal ──
+    // (nx, ny) is the direction whose perpendicular is the offset direction, and
+    // `scale` is the miter factor (1 for a plain normal).
+    function offsetAlongNormal(coord, nx, ny, sideSign, halfD, scale = 1) {
+        const offsetBearing = bearingFromXY(sideSign * ny, -sideSign * nx);
+        return turf.destination(
+            turf.point(coord),
+            (halfD * scale) / 1000,
+            offsetBearing,
+            { units: 'kilometers' }
+        ).geometry.coordinates;
+    }
+
+    // ─── offsetArcPoints: rounded join on the convex side of a bend ────────
+    // A miter on the OUTSIDE of a corner ends up halfD/cos(theta/2) from the vertex
+    // (measured: 24.75m where 17.5m was asked for, at a 90° corner on a 35m gap),
+    // because the perpendicular feet fall beyond both edges. The exact parallel curve
+    // there is an arc of radius halfD centred on the vertex, swept between the two
+    // edge normals.
+    function offsetArcPoints(vertex, incoming, outgoing, sideSign, halfD) {
+        const b1 = bearingFromXY(sideSign * incoming.y, -sideSign * incoming.x);
+        const b2 = bearingFromXY(sideSign * outgoing.y, -sideSign * outgoing.x);
+
+        // Shortest sweep between the two normals, in (-180, 180].
+        const delta = ((b2 - b1 + 540) % 360) - 180;
+        const steps = Math.abs(delta) < 1e-9 ? 1 : OFFSET_ARC_STEPS;
+
+        const points = [];
+        for (let k = 0; k <= steps; k++) {
+            const bearing = (b1 + delta * (k / steps) + 360) % 360;
+            points.push(
+                turf.destination(turf.point(vertex), halfD / 1000, bearing, { units: 'kilometers' })
+                    .geometry.coordinates
+            );
+        }
+        return points;
+    }
+
+    // ─── offsetVertexCoords: per-vertex offset for a guide polyline ─────────
+    // Returns ONE ENTRY PER INPUT VERTEX. An entry is normally a single coordinate —
+    // the miter point, exactly halfD from both adjacent edges — except on the convex
+    // side of a bend, where it is the arc from offsetArcPoints(). Endpoints have a
+    // single edge, where the bisector degenerates to that edge's normal.
+    function offsetVertexCoords(guideCoords, halfD, side) {
+        const out = [];
         const last = guideCoords.length - 1;
+        const sideSign = side === 'left' ? -1 : 1;
 
         for (let i = 0; i <= last; i++) {
-            // Vertex bearing. Middle vertices use the chord between their two
-            // neighbours: averaging the incoming and outgoing bearings breaks at
-            // the 0°/360° wrap (350° and 10° average to 180°), which reverses the
-            // offset direction and spikes the line.
-            // this: the chord is exact for straight vertices and stable at
-            // sharp ones; the fully general form is a vector average
-            // (atan2 of the summed unit vectors), which differs only on bends
-            // tighter than the guide line should ever be.
-            let bearing;
-            if (i === 0) {
-                bearing = turf.bearing(turf.point(guideCoords[0]), turf.point(guideCoords[1]));
-            } else if (i === last) {
-                bearing = turf.bearing(turf.point(guideCoords[last - 1]), turf.point(guideCoords[last]));
-            } else {
-                bearing = turf.bearing(turf.point(guideCoords[i - 1]), turf.point(guideCoords[i + 1]));
+            if (i === 0 || i === last) {
+                const u = i === 0
+                    ? unitVectorMetres(guideCoords[0], guideCoords[1])
+                    : unitVectorMetres(guideCoords[last - 1], guideCoords[last]);
+                out.push([offsetAlongNormal(guideCoords[i], u.x, u.y, sideSign, halfD)]);
+                continue;
             }
 
-            // Perpendicular offset — purely geometric, not traffic-side dependent
-            const offsetBearing = side === 'left'
-                ? (bearing - 90 + 360) % 360
-                : (bearing + 90) % 360;
+            const incoming = unitVectorMetres(guideCoords[i - 1], guideCoords[i]);
+            const outgoing = unitVectorMetres(guideCoords[i], guideCoords[i + 1]);
+            const bxRaw = incoming.x + outgoing.x;
+            const byRaw = incoming.y + outgoing.y;
+            const bisectorLen = Math.hypot(bxRaw, byRaw);
 
-            const dest = turf.destination(turf.point(guideCoords[i]), halfDKm, offsetBearing, { units: 'kilometers' });
-            result.push(dest.geometry.coordinates);
+            if (bisectorLen < 1e-9) {
+                // Exact reversal — no bisector exists. Follow the outgoing edge.
+                out.push([offsetAlongNormal(guideCoords[i], outgoing.x, outgoing.y, sideSign, halfD)]);
+                continue;
+            }
+
+            // cross > 0 means the path turns left at this vertex.
+            const cross = incoming.x * outgoing.y - incoming.y * outgoing.x;
+            // On the convex (outside) side of a bend a miter overshoots, so the true
+            // parallel there is an arc instead.
+            const convex = (cross > 0) !== (sideSign < 0);
+
+            if (convex) {
+                out.push(offsetArcPoints(guideCoords[i], incoming, outgoing, sideSign, halfD));
+            } else {
+                // |u + v| = 2·cos(theta/2) for deflection theta, so 2/|u + v| is exactly
+                // the 1/cos(theta/2) miter factor. Done with vectors, so it is immune to
+                // the 0°/360° wrap that averaging bearings would hit. Without the factor
+                // the offset pinched by cos(theta/2) — measured 12.37m instead of 17.5m
+                // at a 90° corner on a 35m gap.
+                const miterFactor = Math.min(OFFSET_MITER_MAX, 2 / bisectorLen);
+                out.push([
+                    offsetAlongNormal(
+                        guideCoords[i], bxRaw / bisectorLen, byRaw / bisectorLen, sideSign, halfD, miterFactor
+                    )
+                ]);
+            }
         }
 
-        return result;
+        return out;
+    }
+
+    // ─── canonicalOffsetVertex: the one position representing a vertex ─────
+    // Used where a node lands exactly on a guide vertex, so both adjacent segments
+    // agree on it. For a miter that is the miter point; for an arc it is the middle
+    // point, i.e. the bisector direction at radius halfD.
+    function canonicalOffsetVertex(group) {
+        return group[Math.floor(group.length / 2)];
+    }
+
+    // ─── distanceMetres: local planar distance between two lon/lat coords ───
+    // Equirectangular scaling at the mean latitude — far more accurate than the
+    // lengths a drawn guide line has.
+    function distanceMetres(a, b) {
+        const kx = Math.cos(((a[1] + b[1]) / 2) * Math.PI / 180);
+        const dx = (b[0] - a[0]) * kx;
+        const dy = b[1] - a[1];
+        return Math.hypot(dx, dy) * (Math.PI / 180) * 6371008.8;
+    }
+
+    // ─── cumulativeLengthsM: running length of a lon/lat polyline in metres ──
+    function cumulativeLengthsM(coords) {
+        const cum = [0];
+        for (let i = 0; i + 1 < coords.length; i++) {
+            cum.push(cum[i] + distanceMetres(coords[i], coords[i + 1]));
+        }
+        return cum;
+    }
+
+    // ─── offsetPositionAt: the point `dist` metres along the guide, offset halfD ──
+    // Strictly inside an edge the offset uses THAT edge's normal, which keeps the
+    // point directly opposite the guide position it came from — no along-track drift.
+    // On a vertex the vertex's canonical offset is used instead, so a corner is not
+    // pinched and both neighbouring segments pick the same point.
+    function offsetPositionAt(sliceCoords, vertexGroups, cum, dist, halfD, side) {
+        const last = sliceCoords.length - 1;
+        let k = 0;
+        while (k < last - 1 && cum[k + 1] < dist) k++;
+
+        const edgeLen = cum[k + 1] - cum[k];
+        const t = edgeLen > 0 ? (dist - cum[k]) / edgeLen : 0;
+
+        if (t <= VERTEX_EPS) return canonicalOffsetVertex(vertexGroups[k]);
+        if (t >= 1 - VERTEX_EPS) return canonicalOffsetVertex(vertexGroups[k + 1]);
+
+        const a = sliceCoords[k];
+        const b = sliceCoords[k + 1];
+        const u = unitVectorMetres(a, b);
+        const point = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        return offsetAlongNormal(point, u.x, u.y, side === 'left' ? -1 : 1, halfD);
+    }
+
+    // ─── offsetSliceSegment: the offset geometry for one segment's span ────
+    // Walks from dStart to dEnd: the two interpolated endpoints plus every guide
+    // vertex strictly between them (contributing its miter or arc points).
+    function offsetSliceSegment(sliceCoords, vertexGroups, cum, dStart, dEnd, halfD, side) {
+        const out = [offsetPositionAt(sliceCoords, vertexGroups, cum, dStart, halfD, side)];
+        for (let j = 1; j < sliceCoords.length - 1; j++) {
+            if (cum[j] > dStart + VERTEX_EPS_M && cum[j] < dEnd - VERTEX_EPS_M) {
+                out.push(...vertexGroups[j]);
+            }
+        }
+        out.push(offsetPositionAt(sliceCoords, vertexGroups, cum, dEnd, halfD, side));
+
+        // A span shorter than the vertex tolerance can land both endpoints on the same
+        // vertex. WME rejects single-point geometry, and Step 8's collapse guard needs
+        // two points to measure, so close it with a near-zero stub; the guard then
+        // aborts the run cleanly instead of writing bad geometry.
+        if (out.length < 2) out.push([out[0][0] + 1e-9, out[0][1] + 1e-9]);
+        return out;
+    }
+
+    // ─── junctionAtEnd / junctionIndex: where a split's junction node goes ────
+    // The junction with the PREVIOUS segment sits at the END of the produced geometry
+    // for AB/AA and at the START for BA/BB. This rule used to be duplicated — once as
+    // the endpoint adjustment in createSegments() and once as the endpoint read in
+    // executeSplitMutations() — and the two copies have to agree or the point handed to
+    // AddNode is not the coordinate the geometry was written with. It lives here once.
+    const junctionAtEnd = (connMode) => connMode === 'AB' || connMode === 'AA';
+
+    // Index of that endpoint inside a carriageway's coordinates. The two carriageways
+    // are produced in OPPOSITE directions, so the junction is at the end of the LEFT
+    // geometry and the start of the RIGHT one (mirrored for BA/BB).
+    function junctionIndex(coords, connMode, isLeft) {
+        const atEnd = junctionAtEnd(connMode);
+        return (isLeft ? atEnd : !atEnd) ? coords.length - 1 : 0;
+    }
+
+    // ─── parallelJunctionPoint: where two carriageways' offset lines cross ────
+    // At an INTERIOR junction of a multi-segment split the node has to sit where the two
+    // carriageways actually meet while BOTH stay parallel to their own segment — the
+    // intersection of the two offset lines. Placing it on the previous carriageway's own
+    // endpoint (the earlier behaviour) puts it on only ONE of the two offset lines, so the
+    // following carriageway gets dragged off its line: it kinks at the junction, stops
+    // being parallel, and at a bend the node slides away from the perpendicular of the
+    // shared junction node.
+    //
+    // prevSide  – the previous carriageway's junction-side endpoint (it lies on its line)
+    // prevInner – the adjacent vertex of that carriageway, fixing its direction
+    // currOrigEdge – [junctionEnd, innerVertex] of the CURRENT segment's ORIGINAL geometry
+    // node      – the shared junction node's coordinate
+    // halfD     – the carriageway offset
+    // Returns the junction coordinate, or null when the two lines are collinear (a
+    // straight-through junction), where the previous endpoint already IS the junction.
+    function parallelJunctionPoint(prevSide, prevInner, currOrigEdge, node, halfD) {
+        if (!prevSide || !prevInner || !currOrigEdge || !node) return null;
+        const [currAtNode, currAway] = currOrigEdge;
+
+        // Local metric frame centred on the shared node: lon/lat degrees are not
+        // isotropic, so every direction and intersection below is computed in metres.
+        const MPERDEG = Math.PI / 180 * 6371008.8;
+        const kx = Math.cos(node[1] * Math.PI / 180);
+        const toXY = (c) => ({ x: (c[0] - node[0]) * kx * MPERDEG, y: (c[1] - node[1]) * MPERDEG });
+        const toLonLat = (p) => [node[0] + p.x / (kx * MPERDEG), node[1] + p.y / MPERDEG];
+
+        const A = toXY(prevSide);
+        const dIn = unitVectorMetres(prevInner, prevSide);   // chain direction INTO the junction
+        const dOut = unitVectorMetres(currAtNode, currAway); // chain direction OUT of the junction
+        const e = unitVectorMetres(node, prevSide);          // which side the previous carriageway is on
+
+        // The current carriageway is the current segment's own offset, on the SAME side of
+        // the chain as the previous carriageway. "Same side" is measured against the CHAIN
+        // direction — not against the segment's own A→B sense, which can point either way
+        // depending on how the segment happens to be stored — and that is what keeps this
+        // free of the from/to convention.
+        const sPrev = Math.sign(dIn.x * e.y - dIn.y * e.x) || 1;
+        const left = { x: -dOut.y, y: dOut.x };
+        const B = { x: sPrev * left.x * halfD, y: sPrev * left.y * halfD }; // offset point, relative to the node
+
+        const denom = dIn.x * dOut.y - dIn.y * dOut.x;
+        // Straight-through junction: the two offset lines are parallel, so their
+        // intersection cannot be evaluated — only approached as a limit, and that limit is
+        // the PERPENDICULAR FOOT of the shared node, which is exactly where prevSide already
+        // sits. This case used to return null and fall back to the cached coordinate, and
+        // THAT is the path a straight junction takes: the cache is a different carriageway's
+        // earlier endpoint rather than a point derived from this node, and unlike every bent
+        // junction it also skipped pullCarriagewayEnd, so the previous carriageway kept its
+        // own endpoint and the node never ended up on the shared point's perpendicular.
+        if (Math.abs(denom) < 1e-9) {
+            const footDist = Math.hypot(A.x, A.y);
+            // Self-check: prevSide must BE that foot, i.e. halfD from the node. If the end
+            // nearest the node is not the node's own offset point, this shortcut would be
+            // wrong too — decline instead of placing a node on trust.
+            if (Math.abs(footDist - halfD) > ADD_NODE_TOLERANCE_M) {
+                console.warn(`${scriptName} parallelJunctionPoint: the previous carriageway's junction end is ` +
+                    `${footDist.toFixed(3)}m from the shared node (expected ${halfD.toFixed(3)}m) — not using the collinear shortcut`);
+                return null;
+            }
+            return toLonLat(A);
+        }
+
+        // Intersect prev's offset line (through A, direction dIn) with curr's (through B,
+        // direction dOut): A + t·dIn = B + u·dOut.
+        let t = ((B.x - A.x) * dOut.y - (B.y - A.y) * dOut.x) / denom;
+
+        // Bound the miter so a very sharp bend cannot throw the node far from the junction.
+        // The clamp slides along PREV's line, so that carriageway still ends exactly where
+        // its own offset line runs; beyond ~120° of bend no single point is on both lines,
+        // and this keeps the compromise on the side that has already been written.
+        const maxM = halfD * OFFSET_MITER_MAX;
+        const aDotD = A.x * dIn.x + A.y * dIn.y;
+        const tMax = -aDotD + Math.sqrt(Math.max(0, aDotD * aDotD - (A.x * A.x + A.y * A.y - maxM * maxM)));
+        // A sharp bend puts the intersection BEHIND the node (t negative), so the bound is
+        // on |t|, not t. Getting this wrong let a 150° junction place the node twice as far
+        // out as the cap allows.
+        if (Math.abs(t) > tMax) t = Math.sign(t) * tMax;
+
+        const M = { x: A.x + dIn.x * t, y: A.y + dIn.y * t };
+        return toLonLat(M);
+    }
+
+    // ─── junctionEndOfOriginal: which end of the current segment meets the previous ones ──
+    // Compared by COORDINATE, not by node id. A freshly split, unsaved segment does not
+    // report usable from/to node ids — observed on a real run, where intersecting the
+    // carriageways' node-id sets with the current segment's came back EMPTY and the whole
+    // junction snap silently fell back — but its original geometry's two endpoints ARE the
+    // two nodes. Returns the end and inner indices into currCoords, or null when the two
+    // ends are comparably close (a short segment between junctions) and guessing an end
+    // would be worse than falling back to the cached coordinate.
+    function junctionEndOfOriginal(currCoords, prevEnds) {
+        if (!currCoords || currCoords.length < 2 || !prevEnds || prevEnds.length === 0) return null;
+        const last = currCoords.length - 1;
+        const nearestPrev = (c) => Math.min(...prevEnds.map((p) => distanceMetres(c, p)));
+        const dStart = nearestPrev(currCoords[0]);
+        const dEnd = nearestPrev(currCoords[last]);
+
+        const nearD = Math.min(dStart, dEnd);
+        const farD = Math.max(dStart, dEnd);
+        if (farD < Math.max(2 * nearD, 1)) return null;
+
+        return dStart <= dEnd ? { end: 0, inner: 1 } : { end: last, inner: last - 1 };
+    }
+
+    // ─── parallelJunctionSnap: the junction point for one interior junction ──
+    // Gathers what parallelJunctionPoint() needs for the left and the right carriageway.
+    // The shared node is located geometrically, from the current segment's ORIGINAL
+    // endpoints, because the previous carriageways are freshly split and unsaved and so
+    // cannot be relied on to report node ids (see junctionEndOfOriginal).
+    function parallelJunctionSnap(prevLeftId, prevRightId, currSeg, halfD) {
+        const prevLeftSdk  = sdk.DataModel.Segments.getById({ segmentId: prevLeftId });
+        const prevRightSdk = sdk.DataModel.Segments.getById({ segmentId: prevRightId });
+        if (!prevLeftSdk || !prevRightSdk || !currSeg) return null;
+
+        const prevEnds = [];
+        for (const seg of [prevLeftSdk, prevRightSdk]) {
+            const coords = seg.geometry?.coordinates;
+            if (coords && coords.length >= 2) prevEnds.push(coords[0], coords[coords.length - 1]);
+        }
+        if (prevEnds.length === 0) {
+            console.log(`${scriptName} parallelJunctionSnap: no usable previous carriageway geometry`);
+            return null;
+        }
+
+        const origCoords = currSeg.geometry.coordinates;
+        const ends = junctionEndOfOriginal(origCoords, prevEnds);
+        if (!ends) {
+            console.log(`${scriptName} parallelJunctionSnap: could not tell which end of seg ${currSeg.id} meets the previous carriageways — using the cached coordinate`);
+            return null;
+        }
+
+        // The shared junction node IS this original endpoint. createSegments is about to
+        // overwrite the geometry, so the edge is captured now: after the split the junction
+        // vertex already carries the previous carriageway's coordinate and the edge through
+        // it lies on neither offset line.
+        const nodeCoord = origCoords[ends.end];
+        const currEdge = [origCoords[ends.end], origCoords[ends.inner]];
+
+        const pointFor = (prevSeg) => {
+            const coords = prevSeg.geometry.coordinates;
+            const idx = nearestEndIndex(coords, nodeCoord).index;
+            const inner = idx === 0 ? 1 : idx - 1;
+            if (inner < 0 || inner >= coords.length) return null;
+            return parallelJunctionPoint(coords[idx], coords[inner], currEdge, nodeCoord, halfD);
+        };
+
+        const snap = { left: pointFor(prevLeftSdk), right: pointFor(prevRightSdk), node: nodeCoord };
+        console.log(`${scriptName} parallelJunctionSnap: seg ${currSeg.id} junction at its ` +
+            `${ends.end === 0 ? 'start' : 'end'} [${nodeCoord[0].toFixed(6)},${nodeCoord[1].toFixed(6)}] —`,
+            'left=', snap.left ? JSON.stringify(snap.left) : 'collinear (cached end used)',
+            'right=', snap.right ? JSON.stringify(snap.right) : 'collinear (cached end used)');
+        return snap;
+    }
+
+    // ─── nearestEndIndex: closest end of a geometry to a coordinate ──────────
+    // Used by the AddNode check below, which must not assume anything about which end
+    // a segment was written with — it measures instead.
+    function nearestEndIndex(coords, coordinate) {
+        const first = distanceMetres(coordinate, coords[0]);
+        const last = distanceMetres(coordinate, coords[coords.length - 1]);
+        return first <= last ? { index: 0, distance: first } : { index: coords.length - 1, distance: last };
+    }
+
+    // ─── logAddNodeCheck: measures the AddNode placement error ───────────────
+    // The node is created from ONE point, read back out of the current segment's
+    // geometry. Placement is only correct if that point also sits on the facing end of
+    // the segment being joined to it; otherwise WME pulls that segment across to meet
+    // the node and the junction silently moves. Both distances are reported against
+    // whichever end is nearest, so no end convention is assumed here.
+    // ─── junctionDeflectionDeg: how sharply a carriageway turns at its junction end ──
+    // The angle between the edge that ends at the junction and the next edge inward.
+    // 0° = the carriageway runs straight through, which is what a correct junction looks
+    // like on a straight road. This is the measurement that shows a KINKED junction: a
+    // point-coincidence check cannot, because a carriageway whose end has been written onto
+    // the other carriageway's endpoint IS an endpoint of both segments (distance 0.000m)
+    // while being visibly bent there. A junction between two different original segments
+    // legitimately shows the road's own bend, so read the value against how straight the
+    // road is at that node.
+    function junctionDeflectionDeg(coords, nodeCoord) {
+        const idx = nearestEndIndex(coords, nodeCoord).index;
+        const step = idx === 0 ? 1 : -1;
+        const a = coords[idx];
+        const b = coords[idx + step];
+        const c = coords[idx + 2 * step];
+        if (!b || !c) return null;
+
+        const u1 = unitVectorMetres(a, b);  // leaving the junction
+        const u2 = unitVectorMetres(b, c);  // the next edge inward
+        if ((u1.x === 0 && u1.y === 0) || (u2.x === 0 && u2.y === 0)) return null;
+
+        const dot = Math.max(-1, Math.min(1, u1.x * u2.x + u1.y * u2.y));
+        return Math.acos(dot) * 180 / Math.PI;
+    }
+
+    function logAddNodeCheck(label, point, prevSeg, currSeg) {
+        const prevCoords = prevSeg?.geometry?.coordinates;
+        const currCoords = currSeg?.geometry?.coordinates;
+        if (!point || !prevCoords?.length || !currCoords?.length) return;
+
+        const prev = nearestEndIndex(prevCoords, point.coordinates);
+        const curr = nearestEndIndex(currCoords, point.coordinates);
+        // The deflection is reported alongside the distances because the distance ALONE
+        // cannot tell a good junction from a snapped one: writing the new carriageway's end
+        // onto the previous carriageway's endpoint makes the point an endpoint of both
+        // segments, so it reads 0.000m while the carriageway is kinked there.
+        const prevTurn = junctionDeflectionDeg(prevCoords, point.coordinates);
+        const currTurn = junctionDeflectionDeg(currCoords, point.coordinates);
+        const asDeg = (t) => (t === null ? 'n/a' : `${t.toFixed(1)}°`);
+
+        const detail = `${scriptName}   AddNode ${label}: point=[${point.coordinates[0].toFixed(6)},${point.coordinates[1].toFixed(6)}]` +
+            `  to prev end #${prev.index} = ${prev.distance.toFixed(3)}m` +
+            `  to curr end #${curr.index} = ${curr.distance.toFixed(3)}m` +
+            `  deflection prev=${asDeg(prevTurn)} curr=${asDeg(currTurn)}`;
+
+        if (Math.max(prev.distance, curr.distance) > ADD_NODE_TOLERANCE_M) {
+            console.warn(`${detail}  ← MISMATCH (tolerance ${ADD_NODE_TOLERANCE_M}m; WME will move a segment to meet this node)`);
+        } else {
+            log(`${detail}  ok`);
+        }
+    }
+
+    // ─── logJunctionOffset: is the node where the shared point says it should be? ──
+    // Decomposes the node's displacement from the SHARED junction node into "along the road"
+    // and "perpendicular". A straight junction (both carriageways' edges at the node nearly
+    // parallel) must be almost purely perpendicular; an along-road component there means the
+    // node did not land on the shared point's perpendicular and a carriageway has to kink to
+    // reach it. A bend legitimately has both, since its node sits on the bisector.
+    function logJunctionOffset(label, point, nodeCoord, prevSeg, currSeg, halfD) {
+        if (!point || !nodeCoord) return;
+        const prevCoords = prevSeg?.geometry?.coordinates;
+        const currCoords = currSeg?.geometry?.coordinates;
+        if (!prevCoords?.length || !currCoords?.length) return;
+
+        const edgeDir = (coords) => {
+            const idx = nearestEndIndex(coords, nodeCoord).index;
+            const inner = idx === 0 ? 1 : idx - 1;
+            if (inner < 0 || inner >= coords.length) return null;
+            return unitVectorMetres(coords[inner], coords[idx]);
+        };
+        const u = edgeDir(prevCoords);
+        const v = edgeDir(currCoords);
+        if (!u || !v) return;
+
+        // Local metric frame centred on the shared node.
+        const MPERDEG = Math.PI / 180 * 6371008.8;
+        const kx = Math.cos(nodeCoord[1] * Math.PI / 180);
+        const vec = {
+            x: (point.coordinates[0] - nodeCoord[0]) * kx * MPERDEG,
+            y: (point.coordinates[1] - nodeCoord[1]) * MPERDEG
+        };
+        const perp = Math.abs(vec.x * u.y - vec.y * u.x);
+        const along = Math.abs(vec.x * u.x + vec.y * u.y);
+        const angleDeg = Math.acos(Math.max(-1, Math.min(1, u.x * v.x + u.y * v.y))) * 180 / Math.PI;
+
+        const detail = `${scriptName}   junction ${label}: node is ${perp.toFixed(3)}m perpendicular / ` +
+            `${along.toFixed(3)}m along the road from the shared point` +
+            `  (junction angle ${angleDeg.toFixed(2)}°, want perp ${halfD.toFixed(2)}m)`;
+
+        if (angleDeg < 1 && along > 0.5) {
+            console.warn(`${detail}  ← MISMATCH: this junction is straight, so the along-road part should be ~0`);
+        } else {
+            log(`${detail}`);
+        }
+    }
+
+    // ─── verifyAddNodes: confirm each dispatched AddNode really joined its pair ──
+    // The SDK has no node-creation call — the beta Nodes class exposes only
+    // allowNodeTurns / canEdit / canEditTurns / getAll / getById / isVirtual / moveNode —
+    // so the junction node is created through the legacy Waze/Action/AddNode action. That
+    // action can, in principle, attach to the wrong segments or to none at all, and it
+    // reports nothing. The SDK can then tell us what actually happened: getById() returns
+    // the node's geometry and connectedSegmentIds, which is the only trustworthy check
+    // that the placement worked.
+    function verifyAddNodes(wrappers) {
+        for (const wrapper of wrappers) {
+            const node = wrapper.node;
+            if (!node) {
+                console.warn(`${scriptName} AddNode check: the action produced no node`);
+                continue;
+            }
+
+            const nodeId = typeof node.getID === 'function' ? node.getID() : node.attributes?.id;
+            let sdkNode = null;
+            try {
+                sdkNode = sdk.DataModel.Nodes.getById({ nodeId });
+            } catch (ex) {
+                console.warn(`${scriptName} AddNode check: node ${nodeId} lookup threw:`, ex);
+                continue;
+            }
+            if (!sdkNode) {
+                console.warn(`${scriptName} AddNode check: node ${nodeId} is missing from the SDK model`);
+                continue;
+            }
+
+            const connected = Array.isArray(sdkNode.connectedSegmentIds) ? sdkNode.connectedSegmentIds : [];
+            const intended = wrapper.intendedSegmentIds ?? [];
+            const missing = intended.filter((segId) => !connected.includes(segId));
+            const drift = wrapper.intendedPoint
+                ? distanceMetres(wrapper.intendedPoint, sdkNode.geometry.coordinates)
+                : null;
+
+            // NOTE: Nodes.isVirtual() is reported only for context. In WME a node joining
+            // exactly two segments IS still "virtual" (a geometry node), so a true value
+            // here is expected and is not a failure.
+            let isVirtual = null;
+            try {
+                isVirtual = sdk.DataModel.Nodes.isVirtual({ nodeId });
+            } catch (ex) { /* reported as null */ }
+
+            const detail = `${scriptName} AddNode check: node ${nodeId} connected=[${connected.join(', ')}]` +
+                ` (wanted both of [${intended.join(', ')}])` +
+                (drift === null ? '' : `  drift=${drift.toFixed(3)}m`) +
+                (isVirtual === null ? '' : `  isVirtual=${isVirtual}`);
+
+            if (connected.length < 2 || missing.length > 0) {
+                console.warn(`${detail}  ← MISMATCH: the node did not attach to both segments`);
+            } else if (drift !== null && drift > ADD_NODE_TOLERANCE_M) {
+                console.warn(`${detail}  ← MISMATCH: node placed off the intended point`);
+            } else {
+                log(`${detail}  ok`);
+            }
+        }
     }
 
     // ─── createSegments: split one segment and compute offset geometries ──────
@@ -1344,8 +2022,8 @@ Migrated to WME SDK by kid4rm90s
     // turf works in WGS84 (lon/lat). WME SDK segment.geometry is a GeoJSON LineString
     // already in WGS84.
     //
-    function createSegments(sel, displacement, connMode) {
-        console.log(`${scriptName} createSegments: segId=`, sel.id, 'displacement=', displacement, 'connMode=', connMode);
+    function createSegments(sel, displacement, connMode, junctionSnap = null) {
+        console.log(`${scriptName} createSegments: segId=`, sel.id, 'displacement=', displacement, 'connMode=', connMode, 'junctionSnap=', junctionSnap);
         // SDK: segment.geometry is already a GeoJSON LineString { type:'LineString', coordinates:[[lon,lat],...] }
         const geomCoords = sel.geometry.coordinates;
 
@@ -1377,8 +2055,7 @@ Migrated to WME SDK by kid4rm90s
             const bearingLeft  = isLeftHandTraffic ? (bearing - 90 + 360) % 360 : (bearing + 90) % 360;
             const bearingRight = isLeftHandTraffic ? (bearing + 90) % 360 : (bearing - 90 + 360) % 360;
 
-            // Distance along segment for offset endpoints
-            const segLenKm = turf.distance(turf.point(pa), turf.point(pb)); // km
+            // Half the gap in kilometres — the unit turf.destination expects.
             const halfDKm = halfD / 1000;
 
             // Compute offset points at distance halfD from each vertex, perpendicular to bearing
@@ -1449,26 +2126,23 @@ Migrated to WME SDK by kid4rm90s
             rightPoints = aux;
         }
 
-        // Adjust endpoints to match previous iteration's cached connector coords
-        if (last_coord_left_first !== null && last_coord_left_last !== null &&
-            last_coord_right_first !== null && last_coord_right_last !== null) {
+        // Adjust endpoints to match previous iteration's cached connector coords.
+        // junctionIndex() is the same rule executeSplitMutations() reads back with, so
+        // the AddNode point is exactly the coordinate written here.
+        //
+        // junctionSnap (interior multi-segment junctions) wins when present: it is the
+        // intersection of the two offset lines, the only point that keeps BOTH carriageways
+        // parallel. It is null for a straight-through junction, where the two lines are
+        // collinear and the cached connector coordinate is already exact.
+        const cacheReady = last_coord_left_first !== null && last_coord_left_last !== null &&
+            last_coord_right_first !== null && last_coord_right_last !== null;
+        if (junctionSnap?.left || junctionSnap?.right || cacheReady) {
+            const atEnd = junctionAtEnd(connMode);
+            const snapLeft  = junctionSnap?.left  ?? (cacheReady ? (atEnd ? last_coord_left_first  : last_coord_left_last)  : null);
+            const snapRight = junctionSnap?.right ?? (cacheReady ? (atEnd ? last_coord_right_last  : last_coord_right_first) : null);
 
-            if (connMode === "AB") {
-                leftPoints[leftPoints.length - 1]  = last_coord_left_first;
-                rightPoints[0]                     = last_coord_right_last;
-            }
-            if (connMode === "BA") {
-                leftPoints[0]                      = last_coord_left_last;
-                rightPoints[rightPoints.length - 1] = last_coord_right_first;
-            }
-            if (connMode === "AA") {
-                leftPoints[leftPoints.length - 1]  = last_coord_left_first;
-                rightPoints[0]                     = last_coord_right_last;
-            }
-            if (connMode === "BB") {
-                leftPoints[0]                      = last_coord_left_last;
-                rightPoints[rightPoints.length - 1] = last_coord_right_first;
-            }
+            if (snapLeft)  leftPoints[junctionIndex(leftPoints, connMode, true)]    = snapLeft;
+            if (snapRight) rightPoints[junctionIndex(rightPoints, connMode, false)] = snapRight;
         }
 
         // Cache connector coords for next iteration
@@ -1609,6 +2283,236 @@ Migrated to WME SDK by kid4rm90s
 })();
 
 /* Changelog 
+2026.09.25.10 - Split: a STRAIGHT junction now gets the shared point's perpendicular foot:
+                 - REPORT: "where the connected segment is straight ... the added addnode is not
+                   parallel/perpendicular to the old shared point". Bends were fine; only the
+                   straight-through junction was off.
+                 - WHY: parallelJunctionPoint() returns the intersection of the two offset
+                   lines, which does not exist when those lines are parallel — i.e. exactly at
+                   a straight-through junction. That case returned null and fell back to the
+                   cached coordinate: the PREVIOUS carriageway's earlier endpoint rather than a
+                   point derived from this junction's node, and unlike every bent junction it
+                   also skipped pullCarriagewayEnd. So the straight junction was the one case
+                   never positioned from its own shared point.
+                 - FIX: the limit of that intersection as the bend closes is the PERPENDICULAR
+                   FOOT of the shared node, which is where the previous carriageway's junction
+                   end already sits. Return it. A self-check refuses the shortcut with a warning
+                   unless that endpoint really is halfD from the node, so nothing is placed on
+                   trust.
+                 - ADD: logJunctionOffset() splits the node's displacement from the shared point
+                   into PERPENDICULAR and ALONG-ROAD metres and warns when a straight junction
+                   (edges within 1°) has a non-zero along-road part. Neither existing check could
+                   see this: the distance-to-endpoints check reads 0.000m, and the deflection
+                   check measures the bend just INSIDE the segment, not the placement.
+                 - Harness: the 0° case now expects the perpendicular foot instead of a null
+                   fallback, and 0.05°/0.5° were added to show the along-road part vanishing as
+                   the junction straightens (0.0011m / 0.0109m, then 0.000000m). The module
+                   constants the extracted functions rely on are now injected from the
+                   userscript rather than re-typed, so the two cannot drift apart.
+2026.09.25.09 - Cleanup: removed three pieces of dead code. No behaviour change.
+                 Found by counting every reference to each identifier in the file and
+                 ignoring the changelog text itself:
+                 - drivableRoadIds — left over from the deactivated road-conversion code and
+                   never read. Its own comment said it was "kept for reference", which is how
+                   dead code survives.
+                 - segLenKm in createSegments() — turf.distance computed for every edge of
+                   every split segment and never used; only halfDKm (the gap in km) is needed.
+                 - baseDirection — write-only state: declared, reset on every run, assigned at
+                   the first junction, logged... and never read. The per-segment line already
+                   reports connMode for every junction, so the log loses nothing.
+                 Also removed a duplicated blank console.log('') in the test harness.
+2026.09.25.08 - Split: the junction check now reports the KINK, not just the distance:
+                 - WHY: on the .06 run the placement check printed "to prev end #0 = 0.000m
+                   to curr end #14 = 0.000m ok" for a junction that was visibly kinked on the
+                   map. When the new carriageway's end is written ONTO the previous
+                   carriageway's endpoint, that point IS an endpoint of both segments — so
+                   the distance is 0.000m no matter how badly the carriageway is bent there.
+                   A point-coincidence check cannot see a snap onto the wrong line.
+                 - ADD: junctionDeflectionDeg() — the angle between the edge ending at the
+                   junction and the next edge inward — and logAddNodeCheck() prints it for
+                   both participating segments. 0.0° means the carriageway runs straight
+                   through the node. On a straight road that is the number to read; a
+                   junction between two different original segments legitimately shows the
+                   road's own bend instead.
+                 - This is the measurement that should have caught the kink in the first place,
+                   so it is now part of every split run's console output.
+2026.09.25.07 - Split: the interior-junction lookup no longer depends on node ids:
+                 - FIX: on a real run the shared node was found by intersecting the previous
+                   carriageways' node-id sets with the current segment's, and it came back
+                   EMPTY ("expected one shared node, got []") for a correct AA junction. The
+                   carriageways are freshly split and unsaved, so their from/to node ids are
+                   not dependable. The junction is now located GEOMETRICALLY: the shared node
+                   is whichever endpoint of the current segment's ORIGINAL geometry lies
+                   nearest the previously written carriageway ends. An endpoint IS its node,
+                   so no id is needed.
+                 - So a straight-through junction is no longer the only fallback — the previous
+                   version silently used the cached coordinate for EVERY junction, which is
+                   why the placement could still be wrong at a bend.
+                 - junctionEndOfOriginal() refuses to guess when the segment's two ends are
+                   comparably close (a short segment between two junctions); that falls back
+                   to the cached coordinate, which at least stays self-consistent.
+                 - HARDENING: the turn-allowance pass now treats a missing node id as missing
+                   rather than as "not null", and warns when NONE of the produced segments
+                   exposed from/to node ids. The same unsaved-segment behaviour can make that
+                   pass a silent no-op, which would leave turns closed at new junctions — the
+                   warning makes it visible instead of looking like it worked.
+                 - Added junctionEndOfOriginal coverage to tools/junction-miter-test.js.
+2026.09.25.06 - Split: interior junction node placed at the carriageways' TRUE intersection:
+                 - FIX: at an interior junction of a multi-segment split the node was placed on
+                   the PREVIOUS carriageway's own offset endpoint, and the next carriageway's
+                   end was snapped onto it. That point lies on only ONE of the two offset
+                   lines, so at a bend the following carriageway got dragged off its own
+                   line — it kinked at the junction and stopped being parallel, and the node
+                   fell away from the shared junction node's perpendicular while the previous
+                   carriageway kept its own endpoint. parallelJunctionPoint() now intersects
+                   the two offset lines, so BOTH carriageways stay parallel and the node sits
+                   where they actually meet: halfD/cos(theta/2) along the bisector, which is
+                   exactly halfD perpendicular when the junction is straight through.
+                 - Both carriageways' junction endpoints are now written to that point (see
+                   pullCarriagewayEnd), so the node, the previous carriageway and the new
+                   segment all agree on where the junction is.
+                 - The shared node is found by intersecting the node-id SETS of the two
+                   carriageways and the current segment, rather than by the from/to A-B
+                   convention — one less place that convention can be got wrong.
+                 - A straight-through junction makes the two offset lines collinear, so the
+                   intersection is undefined; parallelJunctionPoint() returns null there and
+                   the cached-coordinate path is used, which is already exact at that angle.
+                 - The junction point is computed BEFORE the split, because the current
+                   segment's ORIGINAL geometry is needed: once the junction vertex carries the
+                   previous carriageway's coordinate, the edge through it is on neither offset
+                   line.
+                 - Added tools/junction-miter-test.js.
+2026.09.25.05 - Split: AddNode junction rule made a single source of truth, and measured:
+                 - FIX: the "SDK segment not found" fallback in executeSplitMutations() selected the
+                   OPPOSITE end of both carriageways from the live-model path — it read
+                   last_coord_left_first where the geometry had been written with
+                   last_coord_left_last, and vice versa. On that path the AddNode point was
+                   roughly a whole segment length from the junction, so WME had to drag a
+                   segment across to meet the new node.
+                 - REFACTOR: the AB/AA-vs-BA/BB end convention was duplicated — once as the
+                   endpoint adjustment in createSegments(), once as the endpoint read in
+                   executeSplitMutations(). It is now junctionAtEnd()/junctionIndex(), so the
+                   point handed to AddNode is by construction the coordinate the geometry was
+                   written with, including that the two carriageways run in opposite
+                   directions (junction at the END of the left geometry, the START of the right).
+                 - ADD: logAddNodeCheck() measures, per AddNode, the distance from the chosen
+                   point to the nearest end of BOTH participating segments — deliberately
+                   convention-free — and console.warns above ADD_NODE_TOLERANCE_M = 0.05m.
+                   Run a multi-segment split with DEBUG on and the console now reports the real
+                   placement error instead of us assuming it is correct.
+                 - ADD: a warning when a segment pair cannot be classified as AB/BA/AA/BB.
+                   connMode was only ever assigned, never cleared, so an unmatched pair
+                   silently reused the PREVIOUS iteration's mode, aiming the endpoint
+                   adjustment at the wrong end. Behaviour is unchanged (it still reuses the
+                   mode) but the condition is now visible; whether to skip the join instead
+                   needs a real test.
+                 - NOTE: the WME SDK still has no AddNode equivalent, so multi-segment junction
+                   creation remains on the legacy Waze/Action/AddNode path. Confirmed against
+                   the beta docs: the Nodes class exposes only allowNodeTurns / canEdit /
+                   canEditTurns / getAll / getById / isVirtual / moveNode — there is no
+                   node-creation method, and Segment.geometry is a GeoJSON LineString whose
+                   coordinate order relative to fromNodeId/toNodeId is not documented.
+                 - ADD: verifyAddNodes() asks the SDK what each dispatched AddNode produced —
+                   the node's connectedSegmentIds must be exactly the two participants it was
+                   given, and its geometry must match the intended point — because the legacy
+                   action reports nothing and could attach to the wrong segments or to none.
+                   Nodes.isVirtual() is logged for context only: a node joining exactly two
+                   segments is still "virtual" in WME, so true is expected, not a failure.
+                 - CAUTION: the placement check compares geometry endpoints, but the SDK does
+                   not document which end of a LineString corresponds to fromNodeId. Every
+                   inference here rests on the conventional from-node-to-to-node ordering; a
+                   real split run is what will confirm it.
+2026.09.25.04 - "Make it parallel" now places nodes by ARC LENGTH and rounds convex corners:
+                 - FIX: nodes are positioned by walking the guide to the node's arc length and
+                   stepping halfD along the LOCAL edge normal there. Previously a guide
+                   fraction was mapped onto a fraction of the offset line's own length, which
+                   assumed the offset stretches the guide proportionally. It cannot: at a bend
+                   each guide leg shortens by a constant halfD*tan(theta/2), so on a corner
+                   with uneven legs an interior node slid ALONG the curve. Measured drift at
+                   the worst vertex: 15.83m (legs 20m|400m), 13.61m (50m|400m), 7.95m
+                   (150m|400m), 6.06m (60 deg, 100m|400m), 2.81m (30 deg, 100m|400m); symmetric
+                   corners were already 0.00m. Now ~0 in all cases.
+                 - FIX: the convex (outside) side of a bend gets a rounded join — an arc of
+                   radius halfD centred on the vertex — instead of a miter. A miter there sits
+                   halfD/cos(theta/2) from the vertex because both perpendicular feet fall
+                   beyond the edges: measured 24.75m where 17.5m was asked for, at a 90 deg
+                   corner on a 35m gap. The concave (inside) side keeps the miter, which is
+                   already exact at halfD.
+                 - Removed the slice-subdivision step. It sampled extra points along the guide
+                   slice, but extra points on a straight edge offset to collinear points, so it
+                   never changed the shape — it only inflated the vertex count written into WME.
+                 - The old per-vertex offsetGuideLine() is gone. offsetVertexCoords() is the
+                   per-vertex form: one entry per guide vertex, each an ARRAY of points (a
+                   single miter point, or the points of a rounded join), so it must never be
+                   indexed against the guide as a flat list. Nodes and geometry come from
+                   offsetPositionAt()/offsetSliceSegment(), which work purely in arc length.
+                 - tools/offset-test.js (new) pulls these helpers straight out of this file and
+                   asserts (a) every offset point is exactly halfD from the guide, (b) each
+                   vertex's node straddles that vertex symmetrically, and (c) the two
+                   placement paths agree, so neighbouring segments cannot disagree on a
+                   shared node. Its "old shift" column reproduces the pre-fix drift.
+2026.09.25.03 - Hardened guide-line handling against repeated coordinates:
+                 - FIX: the drawn guide line is de-duplicated (consecutive repeated points
+                   dropped) before it is simplified and offset. A repeated point creates a
+                   zero-length edge, which leaves the offset's angle bisector undefined and
+                   makes turf.bearing() return 0 for that pair. Measured with the harness on
+                   a guide with a tripled vertex: the offset used to collapse to a 0.00m
+                   clearance vertex (a node sitting on the guide line) and spike to 24.75m;
+                   it is now exact like every other case.
+                 - The same fix covers determineSideOfLine(), which reads guideCoords[idx]
+                   and guideCoords[idx + 1] to get the guide's bearing and would compare two
+                   identical points after such a repeat.
+                 - Idea and the de-duplication idiom borrowed from WazePT Segments
+                   (greasyfork 406000, same original author J0N4S13), which offsets a
+                   segment's own polyline in spherical Mercator and mitres corners by
+                   intersecting consecutive offset edge lines.
+                 - That algorithm was benchmarked against this one and matches it on
+                   perpendicular accuracy (17.48m vs 17.50m on a 35m gap; the 2cm gap is its
+                   Mercator-vs-ground-metre conversion). It was NOT adopted because
+                   offsetPolyline() merges duplicate/collinear edges and so cannot preserve
+                   the 1:1 vertex correspondence with the guide that Step 6's per-segment
+                   slicing depends on.
+2026.09.25.02 - Fixed "Make it parallel" not actually being parallel to the guide line:
+                 - FIX: offsetGuideLine() now offsets along the normal to the angle BISECTOR of
+                   each vertex's two edges by halfD / cos(theta/2) — the standard miter —
+                   instead of stepping halfD along the chord between that vertex's two
+                   neighbours. The old form left the offset only halfD * cos(theta/2) from the
+                   guide, so the parallel pair pinched at EVERY bend. Measured on a 35m gap
+                   with a Node/turf harness: 12.37m at a 90 degree corner (exactly
+                   17.5 * cos 45), 15.15m at 60 degrees, and 0.87m where a corner had 20m and
+                   400m legs. All vertices are now exactly halfD at every bend tested
+                   (straight, 10/30/45/60/90 degrees, uneven legs, and two arcs).
+                 - FIX: the chord bearing was only perpendicular when a vertex's two edges were
+                   the same length, which is what made the uneven-leg corner collapse. The
+                   bisector is perpendicular by construction, and it is computed from summed
+                   unit vectors so it avoids the 0/360 degree wrap that averaging bearings
+                   would hit.
+                 - Miter length is capped (OFFSET_MITER_MAX = 2.0, i.e. deflections up to
+                   120 degrees) so a near-reversal cannot fling the offset point outwards.
+                   Past the cap a vertex under-offsets slightly instead of spiking.
+                 - The harness lives outside the repo and extracts this function straight from
+                   the userscript, so it measures the shipped code rather than a copy.
+2026.09.25.01 - Re-added the wme-sdk-plus dependency (pinned to v1.4.1) and grouped both
+                 features into single-undo transactions:
+                 - ADD: @require for wme-sdk-plus @0b212bca, initialised with
+                   initWmeSdkPlus(sdk, { hooks: ['Editing.Transactions'] }) once the SDK is
+                   ready. That module supplies Editing.beginTransaction /
+                   commitTransaction / cancelTransaction / doActions, for which the native
+                   SDK has no equivalent (sdk.Editing only exposes undo / redo / undoAll).
+                 - CHANGE: a split and a "make it parallel" run are now each ONE undo entry
+                   instead of one per segment / node / turn mutation.
+                 - CHANGE: failures now roll back atomically — a throw inside the
+                   transaction discards every change that run had made, so a half-split road
+                   or a partially reshaped junction can no longer be left behind.
+                   executeSplit() gained a try/catch for this. The delta-based rollback in
+                   applyMakeParallel() is retained solely as the no-transaction-support
+                   fallback (it is a no-op after a transaction cancel).
+                 - REFACTOR: executeSplit()'s mutation phase moved to executeSplitMutations()
+                   so it can be handed to withTransaction() as a single synchronous
+                   callback; applyMakeParallelCore() now returns true/false (false = a
+                   pre-mutation validation abort) rather than raising its own success toast.
+                 - Supersedes the 2026.07.26.02 note about doActions being unavailable: that
+                   was a missing initWmeSdkPlus() call, not an absent method.
 2026.09.24.01 - Hardened & tidied "Make it parallel":
                  - FIX: segment endpoints are now reconciled with the moved node positions
                    before geometry is written, so node and geometry always agree (no gaps or
